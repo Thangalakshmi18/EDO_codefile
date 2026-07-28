@@ -1726,9 +1726,9 @@ def execute_llm_retry(
 
             last_exception = ex
 
-            logging.warning(
-                f"LLM Retry {attempt+1}/{MAX_LLM_RETRIES}"
-            )
+            logging.exception(
+    f"LLM Retry {attempt+1}/{MAX_LLM_RETRIES} failed: {ex}"
+)
 
             time.sleep(
                 INITIAL_RETRY_DELAY * (attempt + 1)
@@ -2501,7 +2501,7 @@ def extract_existing_edo_verification_details(
         product_family,
         product,
         templatename,
-        "EDO_NEW_Verification_details",
+        "Edo_existing_Verification",
         db
     )
 
@@ -2521,10 +2521,14 @@ def extract_existing_edo_verification_details(
     prompt_row = {
         "prompt_role": prompt_data["prompt_role"],
         "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + targets,
-        "question": "Fetch verification reference records for the folowing sys number <FMEA_Number> number",
-        "fulltext": "Yes",
-        "where_filter": "",
-        "where_document": "",
+        "question": (
+                f"For RA_Number {'ra_number'} / FMEA_Number {'FMEA_Number'} "
+                "only, extract the full EDO detail record as a single "
+                "JSON object - no other RA/FMEA pairs."
+            ),
+         "fulltext": "Yes",
+         "where_filter": "",
+        "where_document": {"$contains": 'FMEA_Number'},
         "checkpoint": ""
     }
 
@@ -3011,22 +3015,45 @@ def extract_new_edo_tags(
 
     prompt_row = {
         "prompt_role": prompt_data["prompt_role"],
-        "prompt_text": prompt_data["prompt_text"],  
+        "prompt_text": prompt_data["prompt_text"],
         "question": (
-    'Extract every qualifying data row from the complete Risk Assessment and Control / Safety Hazard DFMEA table where the Risk Evaluation value in Column F is not exactly "Low".  Process the entire table from the first data row to the last data row, including all pages, continuation sections, subsections, page breaks, and repeated table headers.  Return one record for every qualifying table row. Do not deduplicate repeated RA numbers or repeated FMEA numbers.  Return only valid JSON using the exact structure specified in the prompt.'
-),
-
+            'Extract risk assessment and control Table from the document'
+        ),
         "fulltext": "Yes",
         "where_filter": "",
+        # NOTE: the "$contains" filter here was returning 0 retrieved
+        # docs (confirmed via RETRIEVED DOCS COUNT logging) - it wasn't
+        # matching the actual chunk text, so it silently starved the LLM
+        # of any context. Matching the pattern used by every other
+        # working fulltext="Yes" call in this file (EDO_EXISTING,
+        # verification-reference, etc.), where_document is left empty so
+        # fulltext mode can pull the full document instead of being
+        # filtered down to nothing.
         "where_document": "",
-        "checkpoint": ('Extract every qualifying data row from the complete Risk Assessment and Control / Safety Hazard DFMEA table where the Risk Evaluation value in Column F is not exactly "Low".  Process the entire table from the first data row to the last data row, including all pages, continuation sections, subsections, page breaks, and repeated table headers.  Return one record for every qualifying table row. Do not deduplicate repeated RA numbers or repeated FMEA numbers.  Return only valid JSON using the exact structure specified in the prompt.')
+        "checkpoint": ('Extract risk assessment and control Table from the document')
     }
 
-    _, _, response = execute_llm_retry(
+    # ---- DIAGNOSTIC: log how many chunks/docs are in this collection,
+    # so we can tell "collection is empty" apart from "filter/retrieval
+    # logic excluded everything".
+    try:
+        collection_count = edo_document["edo_ra_c"]["collection"].count()
+        logging.info(f"edo_ra_c collection count: {collection_count}")
+    except Exception as e:
+        logging.warning(f"Could not inspect edo_ra_c collection count: {e}")
+
+    docs, metadata, response = execute_llm_retry(
         pipeline_config,
-        edo_document["edo_fmea"]["collection"],
+        edo_document["edo_ra_c"]["collection"],
         prompt_row
     )
+
+    # ---- DIAGNOSTIC: confirm content is now actually being retrieved.
+    try:
+        logging.info(f"RETRIEVED DOCS COUNT: {len(docs) if docs else 0}")
+        logging.info(f"RETRIEVED DOCS PREVIEW: {str(docs)[:500]}")
+    except Exception as e:
+        logging.warning(f"Could not log retrieved docs: {e}")
 
     tags = parse_json(response)
     tag_records = deep_extract_records(tags)
@@ -3061,6 +3088,49 @@ def extract_new_edo_tags(
 
     return edo_new_data
 
+def exclude_existing_edo_matches(edo_new_data, existing_records):
+    """
+    Removes any entry from edo_new_data whose (RA_Number, FMEA_Number)
+    pair already exists in existing_records.
+
+    existing_records: an iterable of dict-like objects (or a dict of
+    dicts) that each expose "RA_Number" and "FMEA_Number", representing
+    already-known/previously-processed EDO rows.
+
+    Returns the filtered edo_new_data (same dict, mutated in place).
+    """
+    if not edo_new_data or not existing_records:
+        return edo_new_data
+
+    # Normalize existing_records to an iterable of dicts whether it's
+    # passed as a dict-of-dicts or a list of dicts.
+    if isinstance(existing_records, dict):
+        existing_iter = existing_records.values()
+    else:
+        existing_iter = existing_records
+
+    existing_keys = {
+        (str(rec.get("RA_Number", "")).strip(), str(rec.get("FMEA_Number", "")).strip())
+        for rec in existing_iter
+    }
+
+    keys_to_remove = []
+    for key, entry in edo_new_data.items():
+        ra_number = str(entry.get("RA_Number", "")).strip()
+        fmea_number = str(entry.get("FMEA_Number", "")).strip()
+        if (ra_number, fmea_number) in existing_keys:
+            keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        logging.info(
+            f"Excluding RA={edo_new_data[key].get('RA_Number')!r} "
+            f"FMEA={edo_new_data[key].get('FMEA_Number')!r} - "
+            "already exists in existing records."
+        )
+        del edo_new_data[key]
+
+    return edo_new_data
+
 
 def extract_new_edo_summary_details(
     client,
@@ -3076,14 +3146,7 @@ def extract_new_edo_summary_details(
     STEP 2 of 3: takes the SAME edo_new_data dictionary built by
     extract_new_edo_tags() (keyed by RA id) and, for EVERY entry in it,
     calls the LLM ONE TIME - inside the loop, one RA_Number/FMEA_Number
-    pair per call - to pull that single row's full detail record
-    (Product_Feature_Function, Reason_Identified_as_EDO, Traceability,
-    Verification_Reference, EDO_Location, EDO_Description,
-    Reason_Identified_as_EDO_ColH).
-
-    Each result is written straight back into edo_new_data[key], so the
-    dictionary ends up holding the tag info AND the full detail info
-    for every RA id in one place.
+    pair per call - to pull that single row's full detail record.
     """
     logging.info("=" * 80)
     logging.info("STAGE 4b: WORKFLOW 2 - NEW EDO FULL DETAIL EXTRACTION (PER RA/FMEA, LOOPED)")
@@ -3101,6 +3164,8 @@ def extract_new_edo_summary_details(
         "EDO_NEW_details"
     )
 
+    keys_to_remove = []
+
     for key, entry in edo_new_data.items():
         ra_number = entry.get("RA_Number", "")
         fmea_number = entry.get("FMEA_Number", "")
@@ -3117,17 +3182,36 @@ def extract_new_edo_summary_details(
             ),
             "fulltext": "Yes",
             "where_filter": "",
-            "where_document": "",
+            "where_document": {"$contains": "Safety Hazard DFMEA Table"},
             "checkpoint": ""
         }
 
+        # --- LOGGING: Inspect Prompt Row Filters & Collection state ---
+        logging.info(f"--- DEBUG RETRIEVAL ATTEMPT for RA={ra_number!r} FMEA={fmea_number!r} ---")
+        logging.info(f"where_document filter being applied: {prompt_row['where_document']}")
+
+        try:
+            collection_count = edo_document["edo_fmea"]["collection"].count()
+            logging.info(f"edo_fmea collection total count: {collection_count}")
+        except Exception as e:
+            logging.warning(f"Could not inspect edo_fmea collection count: {e}")
+
         detail_row = {}
         try:
-            _, _, response = execute_llm_retry(
+            docs, metadata, response = execute_llm_retry(
                 pipeline_config,
                 edo_document["edo_fmea"]["collection"],
                 prompt_row
             )
+
+            # --- LOGGING: Detailed Chunk & Metadata Diagnostics ---
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - RETRIEVED DOCS COUNT: {len(docs) if docs else 0}")
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - RETRIEVED DOCS TYPE: {type(docs)}")
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - RETRIEVED DOCS CONTENT PREVIEW: {str(docs)[:500]}")
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - METADATA TYPE: {type(metadata)}")
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - METADATA CONTENT PREVIEW: {str(metadata)[:500]}")
+            logging.info(f"RA={ra_number!r} FMEA={fmea_number!r} - RAW LLM RESPONSE PREVIEW: {str(response)[:300]}")
+
             parsed = parse_json(response)
             records = deep_extract_records(parsed)
             if records:
@@ -3143,8 +3227,11 @@ def extract_new_edo_summary_details(
 
         if not detail_row:
             logging.warning(
-                f"No detail record returned for RA={ra_number!r} FMEA={fmea_number!r}."
+                f"No detail record returned for RA={ra_number!r} FMEA={fmea_number!r}. "
+                "Excluding this entry from edo_new_data."
             )
+            keys_to_remove.append(key)
+            continue
 
         entry["Product_Feature_Function"] = get_llm_value(
             detail_row, "Product_Feature_Function", "Product Feature Function"
@@ -3168,9 +3255,14 @@ def extract_new_edo_summary_details(
             detail_row, "Reason_Identified_as_EDO_ColH", "reason_2"
         )
 
+    # Remove entries that had no detail record returned.
+    for key in keys_to_remove:
+        del edo_new_data[key]
+
     logging.info(
         f"extract_new_edo_summary_details: enriched {len(edo_new_data)} "
-        f"entries in edo_new_data with full detail records."
+        f"entries in edo_new_data with full detail records "
+        f"({len(keys_to_remove)} excluded due to missing details)."
     )
 
     return edo_new_data
