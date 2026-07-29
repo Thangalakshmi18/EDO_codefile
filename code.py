@@ -8,18 +8,13 @@ import unicodedata
 import zipfile
 import tempfile
 import openpyxl
-import fitz
+import fitz  # PyMuPDF
 
 from openpyxl.styles import Alignment, Border, Side, Font, PatternFill
-from openpyxl.cell.text import InlineFont
-from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.utils.units import pixels_to_EMU
-
-from Files.database import DatabaseHandler
-from retrieval.retrieve_content_prompt import retrieve_content_for_prompt
 
 # ==========================================================
 # GLOBALS & STYLES SETUP
@@ -41,13 +36,22 @@ RED_CONSOLE = "\033[91m"
 RESET_CONSOLE = "\033[0m"
 
 cell_alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
-thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="thin"), bottom=Side(style="thin"))
+thin_border = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin")
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     stream=sys.stdout
 )
+
+# ==========================================================
+# DEPENDENCY HELPER FUNCTIONS (UTILITIES & RECURSIVE EXTRACTION)
+# ==========================================================
 
 def print_red(label, text):
     print(f"{RED_CONSOLE}{label}:\n{text}{RESET_CONSOLE}")
@@ -71,6 +75,71 @@ def normalize_id(value):
 
 def get_fixed_sysdd_reference():
     return "SYSDD-1234"
+
+def deep_extract_records(data):
+    """
+    Recursively inspects dicts/lists returned by LLMs or JSON parsers 
+    to extract flattened record lists regardless of nested structures.
+    """
+    if isinstance(data, list):
+        records = []
+        for item in data:
+            records.extend(deep_extract_records(item))
+        return records
+    elif isinstance(data, dict):
+        if "records" in data and isinstance(data["records"], list):
+            return deep_extract_records(data["records"])
+        elif "data" in data:
+            return deep_extract_records(data["data"])
+        elif "items" in data:
+            return deep_extract_records(data["items"])
+        else:
+            return [data]
+    return []
+
+def parse_llm_json_response(response_text):
+    """
+    Cleans markdown code fences and parses JSON safely, returning a list of dicts.
+    """
+    if not response_text:
+        return []
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", response_text.strip(), flags=re.DOTALL).strip()
+    try:
+        parsed = json.loads(cleaned)
+        return deep_extract_records(parsed)
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse LLM response as JSON: {e}")
+        return []
+
+def safe_llm_call_with_retry(call_func, *args, **kwargs):
+    """
+    Wrapper for robust API calls with exponential backoff retries.
+    """
+    delay = INITIAL_RETRY_DELAY
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        try:
+            return call_func(*args, **kwargs)
+        except Exception as e:
+            logging.warning(f"LLM call attempt {attempt} failed: {e}")
+            if attempt == MAX_LLM_RETRIES:
+                raise e
+            time.sleep(delay)
+            delay *= 2
+
+def resolve_document_path(filename, search_roots=None):
+    """
+    Searches provided document roots to locate target PDFs or files.
+    """
+    roots = search_roots or DEFAULT_DOCUMENT_SEARCH_ROOTS
+    for root in roots:
+        candidate = os.path.join(root, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return filename
+
+# ==========================================================
+# STYLING & RISK CLASSIFICATION DEPENDENCIES
+# ==========================================================
 
 def _apply_border_alignment(cell):
     cell.border = thin_border
@@ -102,8 +171,51 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
     return f"Existing EDO ({tag_value}) recommendations: Maintain current traceability."
 
 # ==========================================================
-# 1. IMAGE HANDLING
+# IMAGE EXTRACTION & HANDLING DEPENDENCIES
 # ==========================================================
+
+def extract_images_from_pdf(pdf_path):
+    """
+    Extracts embedded images from a PDF document using PyMuPDF (fitz).
+    """
+    extracted_images = []
+    if not os.path.exists(pdf_path):
+        logging.warning(f"PDF path not found for image extraction: {pdf_path}")
+        return extracted_images
+
+    doc = fitz.open(pdf_path)
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+            extracted_images.append({
+                "bytes": image_bytes,
+                "extension": f".{image_ext}",
+                "page": page_index + 1
+            })
+    return extracted_images
+
+def extract_images_from_docx_or_zip(file_path):
+    """
+    Extracts images from OpenXML/Zip container formats (e.g., .docx or .xlsx).
+    """
+    images = []
+    if not os.path.exists(file_path) or not zipfile.is_zipfile(file_path):
+        return images
+
+    with zipfile.ZipFile(file_path, 'r') as z:
+        for filename in z.namelist():
+            if filename.startswith("word/media/") or filename.startswith("xl/media/"):
+                ext = os.path.splitext(filename)[1]
+                images.append({
+                    "bytes": z.read(filename),
+                    "extension": ext
+                })
+    return images
 
 def insert_image_below_text(sheet, image, row, column=8, text_offset_px=IMAGE_TEXT_OFFSET_PX):
     if not image:
@@ -131,11 +243,10 @@ def insert_image_below_text(sheet, image, row, column=8, text_offset_px=IMAGE_TE
         return False
 
 # ==========================================================
-# 2. EXISTING EDO EXTRACTIONS (CALL 1, 2, 3)
+# EXISTING EDO EXTRACTIONS (CALL 1, 2, 3)
 # ==========================================================
 
-# CALL 1: Extract Existing EDO Tags
-def call_1_extract_existing_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, db: DatabaseHandler):
+def call_1_extract_existing_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, db):
     prompt = db.get_prompt_by_name(client, product_family, product, templatename, "EDO_Existing_Tag")
     prompt_row = {
         "prompt_role": prompt["prompt_role"],
@@ -150,11 +261,9 @@ def call_1_extract_existing_edo_tags(client, product_family, product, templatena
         prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
     )
 
-    parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-    items = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+    records = parse_llm_json_response(response)
     existing_edos = {}
-    for item in items:
+    for item in records:
         tag = normalize_text(item.get("edo_number") or item.get("edo_tag") or "")
         if tag and tag.lower() != "blank" and tag not in existing_edos:
             existing_edos[tag] = {
@@ -170,8 +279,7 @@ def call_1_extract_existing_edo_tags(client, product_family, product, templatena
             }
     return existing_edos
 
-# CALL 2: Extract Existing EDO Row Details
-def call_2_extract_existing_edo_details(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db: DatabaseHandler):
+def call_2_extract_existing_edo_details(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db):
     prompt = db.get_prompt_by_name(client, product_family, product, templatename, "EDO_Existing_Generic")
 
     for edo_tag, edo in existing_edos.items():
@@ -189,9 +297,7 @@ def call_2_extract_existing_edo_details(client, product_family, product, templat
             prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
         )
 
-        parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-        records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+        records = parse_llm_json_response(response)
         if records:
             rec = records[0]
             edo["edo_description"] = format_output_text(rec.get("edo_description") or rec.get("description"))
@@ -202,8 +308,7 @@ def call_2_extract_existing_edo_details(client, product_family, product, templat
 
     return existing_edos
 
-# CALL 3: Extract Existing EDO Traceability
-def call_3_extract_existing_edo_trace(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db: DatabaseHandler):
+def call_3_extract_existing_edo_trace(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db):
     if "edo_fmea" not in edo_document:
         return existing_edos
 
@@ -225,20 +330,17 @@ def call_3_extract_existing_edo_trace(client, product_family, product, templaten
             prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
         )
 
-        parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-        records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+        records = parse_llm_json_response(response)
         if records:
             edo["existing_trace"] = format_output_text(records[0].get("Traceability") or records[0].get("Trace To RAC#"))
 
     return existing_edos
 
 # ==========================================================
-# 3. NEW EDO EXTRACTIONS (CALL 5, 6 & POST-CALLS)
+# NEW EDO EXTRACTIONS (CALL 5, 6 & POST-CALLS)
 # ==========================================================
 
-# CALL 5: New EDO Tags (Refers explicitly to EDO_RA_C)
-def call_5_extract_new_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db: DatabaseHandler):
+def call_5_extract_new_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db):
     prompt = db.get_prompt_by_name(client, product_family, product, templatename, "EDO_New_Tag")
     prompt_row = {
         "prompt_role": prompt["prompt_role"],
@@ -254,9 +356,7 @@ def call_5_extract_new_edo_tags(client, product_family, product, templatename, p
         prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
     )
 
-    parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-    items = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+    items = parse_llm_json_response(response)
     existing_tags_set = {normalize_text(k).lower() for k in existing_edos.keys()}
     new_edos = {}
 
@@ -269,14 +369,13 @@ def call_5_extract_new_edo_tags(client, product_family, product, templatename, p
                 "edo_description": "",
                 "reason_identified": "",
                 "dfmea": "",
-                "verification_reference": "",  # Verification Reference set as Blank
+                "verification_reference": "",
                 "RA_Number": item.get("RA_Number", ""),
                 "FMEA_Number": item.get("FMEA_Number", "")
             }
     return new_edos
 
-# CALL 6: Extract New EDO Summary Details
-def call_6_extract_new_edo_summary_details(client, product_family, product, templatename, pipeline_config, edo_document, new_edos, db: DatabaseHandler):
+def call_6_extract_new_edo_summary_details(client, product_family, product, templatename, pipeline_config, edo_document, new_edos, db):
     prompt = db.get_prompt_by_name(client, product_family, product, templatename, "EDO_New_Generic")
 
     for tag, edo in new_edos.items():
@@ -294,21 +393,18 @@ def call_6_extract_new_edo_summary_details(client, product_family, product, temp
             prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
         )
 
-        parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-        records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+        records = parse_llm_json_response(response)
         if records:
             rec = records[0]
             edo["edo_description"] = format_output_text(rec.get("edo_description") or rec.get("description"))
             edo["reason_identified"] = format_output_text(rec.get("reason_identified") or rec.get("reason"))
             edo["dfmea"] = format_output_text(rec.get("dfmea"))
 
-        edo["verification_reference"] = ""  # Return Verification Reference as blank initially
+        edo["verification_reference"] = ""
 
     return new_edos
 
-# SEPARATE CALL: Verification Reference Details
-def extract_new_edo_verification_details(client, product_family, product, templatename, pipeline_config, edo_document, ra_fmea_pairs, db: DatabaseHandler):
+def extract_new_edo_verification_details(client, product_family, product, templatename, pipeline_config, edo_document, ra_fmea_pairs, db):
     verification_source_key = "edo_fmea" if "edo_fmea" in edo_document else "edo_ra_c"
     prompt_data = db.get_prompt_by_name(client, product_family, product, templatename, "Edo_existing_Verification")
 
@@ -330,9 +426,7 @@ def extract_new_edo_verification_details(client, product_family, product, templa
     )
     print_red("EXTRACTED VERIFICATION REFERENCE DETAILS", response)
 
-    parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-    records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+    records = parse_llm_json_response(response)
     verifications = {}
     for item in ra_fmea_pairs:
         row_id = item["row"]
@@ -353,8 +447,7 @@ def extract_new_edo_verification_details(client, product_family, product, templa
 
     return verifications
 
-# SEPARATE CALL: Traceability Details
-def extract_traceability_details(client, product_family, product, templatename, pipeline_config, edo_document, ra_fmea_pairs, db: DatabaseHandler):
+def extract_traceability_details(client, product_family, product, templatename, pipeline_config, edo_document, ra_fmea_pairs, db):
     if "edo_fmea" not in edo_document:
         return {}
 
@@ -376,9 +469,7 @@ def extract_traceability_details(client, product_family, product, templatename, 
         prompt_row["fulltext"], prompt_row["where_filter"], prompt_row["where_document"]
     )
 
-    parsed = json.loads(re.sub(r"^```json\s*|\s*```$", "", response, flags=re.DOTALL).strip())
-    records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-
+    records = parse_llm_json_response(response)
     traceability_map = {}
     for item in ra_fmea_pairs:
         row_id = item["row"]
@@ -397,7 +488,7 @@ def extract_traceability_details(client, product_family, product, templatename, 
     return traceability_map
 
 # ==========================================================
-# 4. EXCEL WRITING & FORMATTING (YOUR PROVIDED CODE STRUCTURE)
+# EXCEL WRITING & FORMATTING FUNCTIONS
 # ==========================================================
 
 def merge_existing_edo_rows(sheet, start_row, end_row):
@@ -430,33 +521,15 @@ def merge_existing_edo_rows(sheet, start_row, end_row):
 
         current = last + 1
 
-
 def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=None, new_edo_diagram_queue=None):
-    """
-    Final writer:
-    A-E : existing columns (Column E stores combined Verification Reference / Traceability value)
-    F   : Left empty as requested (Column 6 has no values)
-    G-I : new EDO fields
-    H   : carries images
-    K   : Risk Classification
-    L   : Risk evaluation text / classification trigger
-    M   : Gap and Verification Status statement
-    """
-
     current_row = start_row
     existing_ranges = []
     image_queue = list(images) if images else []
     new_edo_diagram_queue = list(new_edo_diagram_queue) if new_edo_diagram_queue else []
-    last_image_row = start_row
 
     for key, edo in final_edos.items():
-
         is_new = edo.get("edo_type") == "New"
-
-        if is_new:
-            tag_value = "EDO-XX\nNew"
-        else:
-            tag_value = format_edo_tag_text(edo.get("edo_tag") or key)
+        tag_value = "EDO-XX\nNew" if is_new else format_edo_tag_text(edo.get("edo_tag") or key)
 
         raw_location = format_output_text(edo.get("location"))
         design_elements = edo.get("design_elements") or []
@@ -482,10 +555,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
             ]
 
         first = current_row
-        last_image_for_this_edo = None
 
         for idx, row_data in enumerate(split_rows):
-
             col_g_value = row_data["location"]
             col_h_value = format_output_text(row_data["description_2"])
             col_i_value = format_output_text(row_data["reason_2"])
@@ -511,24 +582,19 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                     if not normalize_text(col_i_value):
                         col_i_value = "None"
 
-            # Column D: for Existing EDOs only, append the trace text
             col_d_value = format_output_text(edo.get("dfmea"))
             if not is_new:
                 trace_text = format_output_text(edo.get("existing_trace"))
                 if trace_text:
                     col_d_value = f"{col_d_value}\n Trace:{trace_text}" if col_d_value else trace_text
 
-            logging.info(f"{key} dfmea raw: {edo.get('dfmea')}")
-            logging.info(f"{key} existing_trace raw: {edo.get('existing_trace')}")
-            logging.info(f"{key} final column D value: {col_d_value}")
-
             values = {
                 1: tag_value,
                 2: format_output_text(edo.get("edo_description")) if idx == 0 else "",
                 3: format_output_text(edo.get("reason_identified")),
                 4: col_d_value,
-                5: format_output_text(edo.get("verification_reference")),  # Column E holds Verification/Traceability value
-                6: "",  # Column 6 / Column F explicitly left empty
+                5: format_output_text(edo.get("verification_reference")),
+                6: "",  # Column F explicitly left empty
                 7: col_g_value,
                 8: col_h_value,
                 9: col_i_value,
@@ -536,18 +602,10 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                 11: "None",
             }
 
-            # Risk Classification (Column L / Column 12)
-            risk_input = (
-                f"{format_output_text(edo.get('reason_identified') or '')} "
-                f"{format_output_text(edo.get('dfmea') or '')}"
-            )
+            risk_input = f"{format_output_text(edo.get('reason_identified') or '')} {format_output_text(edo.get('dfmea') or '')}"
             risk = classify_risk_status(risk_input, pipeline_config)
             values[12] = risk
-
-            # Remarks and Recommendation (Column M / Column 13)
-            values[13] = generate_remarks_and_recommendation(
-                edo, tag_value, is_new, risk, pipeline_config
-            )
+            values[13] = generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_config)
 
             for col, value in values.items():
                 cell = sheet.cell(current_row, col)
@@ -556,58 +614,33 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             apply_risk_cell_style(sheet.cell(current_row, 12), risk)
 
-            # Image Placement logic in Column H
+            # Image Placement Logic in Column H (Column 8)
             row_image = None
-            has_ra_fmea_in_col_d = bool(
-                normalize_text(edo.get("RA_Number")) or normalize_text(edo.get("FMEA_Number"))
-            )
+            has_ra_fmea = bool(normalize_text(edo.get("RA_Number")) or normalize_text(edo.get("FMEA_Number")))
 
-            if is_new and has_ra_fmea_in_col_d and new_edo_diagram_queue:
+            if is_new and has_ra_fmea and new_edo_diagram_queue:
                 row_image = new_edo_diagram_queue.pop(0)
-                logging.info(f"COLUMN H (row {current_row}, key {key!r}): placed next queued New EDO diagram.")
-            elif is_new and has_ra_fmea_in_col_d:
-                logging.warning(f"COLUMN H (row {current_row}, key {key!r}): New EDO diagram queue is empty.")
-
-            if not row_image and not is_new:
-                if image_queue:
-                    row_image = image_queue.pop(0)
-                    last_image_for_this_edo = row_image
+            elif not row_image and not is_new and image_queue:
+                row_image = image_queue.pop(0)
 
             if row_image:
                 insert_image_below_text(sheet, row_image, row=current_row, column=8, text_offset_px=IMAGE_TEXT_OFFSET_PX)
-                last_image_row = current_row
-                last_image_for_this_edo = row_image
-            else:
-                logging.error(f"COLUMN H WILL BE EMPTY at row {current_row} for key {key!r}")
 
             current_row += 1
 
         if not is_new:
             existing_ranges.append((first, current_row - 1))
 
-    # Perform Merging for Existing EDOs across Columns A-E (1-5) and L-M (12-13)
     for first, last in existing_ranges:
         if last > first:
             for col in range(1, 6):
-                sheet.merge_cells(
-                    start_row=first,
-                    start_column=col,
-                    end_row=last,
-                    end_column=col
-                )
+                sheet.merge_cells(start_row=first, start_column=col, end_row=last, end_column=col)
                 sheet.cell(first, col).alignment = cell_alignment
             for col in (12, 13):
-                sheet.merge_cells(
-                    start_row=first,
-                    start_column=col,
-                    end_row=last,
-                    end_column=col
-                )
+                sheet.merge_cells(start_row=first, start_column=col, end_row=last, end_column=col)
                 sheet.cell(first, col).alignment = cell_alignment
 
-    print(f"current _value:")
     return current_row
-
 
 def clear_existing_rows(sheet, start_row, end_column=10):
     row = start_row
@@ -623,30 +656,28 @@ def clear_existing_rows(sheet, start_row, end_column=10):
             sheet.cell(row=row, column=col).value = None
         row += 1
 
-
 def save_edo_workbook(workbook, pipeline_config):
     output_path = pipeline_config["output_file_path"]
     workbook.save(output_path)
     return output_path
 
 # ==========================================================
-# 5. FULL PIPELINE EXECUTION WORKFLOW
+# FULL PIPELINE EXECUTION WORKFLOW
 # ==========================================================
 
-def run_edo_pipeline(client, product_family, product, templatename, pipeline_config, edo_document, db: DatabaseHandler):
-    # STEP 1: Existing EDO Extraction
+def run_edo_pipeline(client, product_family, product, templatename, pipeline_config, edo_document, db):
+    # STEP 1: Existing EDO Extractions
     existing_edos = call_1_extract_existing_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, db)
     existing_edos = call_2_extract_existing_edo_details(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db)
     existing_edos = call_3_extract_existing_edo_trace(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db)
 
-    # STEP 2: New EDO Extraction
+    # STEP 2: New EDO Extractions
     new_edos = call_5_extract_new_edo_tags(client, product_family, product, templatename, pipeline_config, edo_document, existing_edos, db)
     new_edos = call_6_extract_new_edo_summary_details(client, product_family, product, templatename, pipeline_config, edo_document, new_edos, db)
 
-    # Combine into unified dictionary for format_edo_worksheet
     final_edos = {**existing_edos, **new_edos}
 
-    # STEP 3: Load Workbook and Initial Format/Populate
+    # STEP 3: Initial Excel Generation
     workbook = openpyxl.load_workbook(pipeline_config["input_file_path"])
     sheet = workbook.active
     start_row = 2
@@ -654,7 +685,7 @@ def run_edo_pipeline(client, product_family, product, templatename, pipeline_con
     format_edo_worksheet(sheet, final_edos, start_row, pipeline_config)
     output_path = save_edo_workbook(workbook, pipeline_config)
 
-    # STEP 4: Post-Excel Operations (Column D match -> Separate Verification & Traceability Calls -> Fill Column E)
+    # STEP 4: Post-Excel Operations (Populate Column E with Verification & Traceability)
     ra_fmea_pairs = []
     for row in range(2, sheet.max_row + 1):
         cell_val = sheet.cell(row=row, column=4).value or ""
@@ -682,4 +713,4 @@ def run_edo_pipeline(client, product_family, product, templatename, pipeline_con
         sheet.cell(row=r, column=6, value="")             # Column F (6) left empty
 
     save_edo_workbook(workbook, pipeline_config)
-    logging.info(f"Pipeline complete. File saved to: {output_path}")
+    logging.info(f"Pipeline complete. Output saved to: {output_path}")
