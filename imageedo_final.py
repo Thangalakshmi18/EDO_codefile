@@ -3414,6 +3414,8 @@ def apply_risk_cell_style(cell, risk):
         cell.fill = PatternFill(fill_type=None)
 
 
+
+
 def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_config):
     """
     Builds Column M ("Remarks and Recommendation") content:
@@ -3421,10 +3423,9 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
       2. Optional "Observation" block - flagged when the FMEA/RA&C trace text
          (Column D) states a DIFFERENT risk level than the assigned Risk
          Classification (Column L)
-      3. Optional "Recommendation"/"Design" block - feature-specific safety
-         mitigation text (manual warning, drawing/design note, or training),
-         generated from the EDO's feature/reason fields when the hazard
-         warrants it
+      3. Optional "Recommendation"/"Design" block - category-driven, feature-specific
+         safety mitigation text (manual warning, drawing note, training, or combined),
+         generated from EDO feature/reason fields.
     """
 
     # ---- 1. Base boilerplate (Gap + Verification Status) ----
@@ -3457,21 +3458,18 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
     if dfmea_text and risk:
         obs_prompt = f"""
-        You are reviewing an Essential Design Output (EDO) risk record.
+You are reviewing an Essential Design Output (EDO) risk record.
 
-        Risk Classification assigned (Column L): {risk}
-        System FMEA / RA&C trace text (Column D): {dfmea_text}
+Risk Classification assigned (Column L): {risk}
+System FMEA / RA&C trace text (Column D): {dfmea_text}
 
-        Does the FMEA/RA&C trace text explicitly state a DIFFERENT risk
-        evaluation (e.g. 'Low', 'Medium', 'High') than the assigned Risk
-        Classification above?
+Does the FMEA/RA&C trace text explicitly state a DIFFERENT risk evaluation (e.g., 'Low', 'Medium', 'High') than the assigned Risk Classification above?
 
-        If yes, reply with EXACTLY this sentence, filling in the FMEA's
-        stated level and the assigned classification (lowercase):
-        Observation: In Sys-FMEA, the risk evaluation is '<fmea_level>'. recommended to change in the sys-FMEA as <assigned_level_lowercase>.
+If yes, reply with EXACTLY this sentence, filling in the FMEA's stated level and the assigned classification (lowercase):
+Observation: In Sys-FMEA, the risk evaluation is '<fmea_level>'. recommended to change in the sys-FMEA as <assigned_level_lowercase>.
 
-        If no mismatch is found, reply with exactly: NONE
-        """
+If no mismatch is found, reply with exactly: NONE
+"""
 
         try:
             obs_response = call_llm(obs_prompt, pipeline_config)
@@ -3481,11 +3479,7 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
         except Exception as e:
             logging.error(f"Observation generation failed: {e}")
 
-        # ---- Fallback: LLM unavailable/failed/returned nothing usable ----
-        # Rather than silently dropping the Observation block, fall back
-        # to a direct keyword scan of the FMEA/RA&C trace text for a
-        # stated risk level that disagrees with the assigned
-        # classification, so a mismatch still gets surfaced.
+        # Fallback keyword scan if LLM is unavailable or yields non-answer
         if not observation_text:
             observation_text = _fallback_observation_text(dfmea_text, risk)
 
@@ -3496,27 +3490,36 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
     if feature_text or reason_text:
         rec_prompt = f"""
-        You are drafting a "Recommendation" note for an Essential Design
-        Output (EDO) risk record, matching this house style:
+You are preparing the "Recommendation" section of an Essential Design Output checklist.
 
-        - If the hazard needs a User Manual warning/precaution, write it
-          starting with "Recommendation:" (or "Recommendation to add in the
-          User Manual:") followed by concrete warning text.
-        - If the hazard needs a drawing/design change (e.g. a load rating,
-          dimension note, or EDO symbol placement), write it starting with
-          "Design:" followed by the specific design note.
-        - If training is the appropriate mitigation, write it starting with
-          "Recommendation:" followed by the training instruction.
-        - If NONE of the above genuinely apply (the base Gap/Verification
-          Status boilerplate is already sufficient), reply with exactly:
-          NONE
+Study the Product Feature and Reason Identified below:
+Product Feature/Function: {feature_text}
+Reason Identified as EDO: {reason_text}
 
-        Product Feature/Function: {feature_text}
-        Reason Identified as EDO: {reason_text}
+First, determine which category best applies:
 
-        Only return the recommendation block itself (or NONE) - do not
-        repeat the Gap or Verification Status text.
-        """
+Category A: User Manual recommendation
+- Use if the feature involves: electrical safety, cables, power cord, hoses, connectors, patient interaction, warning labels, handling, cleaning, maintenance, storage, or placement/stability.
+
+Category B: Drawing/Design recommendation
+- Use if the feature involves: dimensions, tolerances, load ratings, drawings, materials, CAD, mechanical strength, or hardware specs.
+
+Category C: Training recommendation
+- Use if users/operators must be specifically instructed before using or connecting the product to mitigate risk of misuse.
+
+Category D: Combined Design and User Manual
+- Use if both drawing/design specifications AND user manual caution/warning statements are required.
+
+Category E: No recommendation
+- Reply with NONE if the base Gap and Verification Status boilerplate is already completely sufficient.
+
+RULES:
+1. Write concrete, domain-specific engineering recommendations matched to the exact component. Do NOT write generic or vague placeholders.
+2. If Category A, format headers as "Recommendation:" or "Recommendation to add in the User Manual:" followed by bulleted/structured warnings or precautions.
+3. If Category B, start with "Design:" or "Recommendation:" specifying drawing notes or load/dimensional limits.
+4. If Category C, start with "Recommendation:" specifying operator training parameters.
+5. Return ONLY the recommendation text block itself (or NONE). Do not repeat Gap or Verification text.
+"""
 
         try:
             rec_response = call_llm(rec_prompt, pipeline_config)
@@ -3526,10 +3529,7 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
         except Exception as e:
             logging.error(f"Recommendation generation failed: {e}")
 
-        # ---- Fallback: LLM unavailable/failed/returned nothing usable ----
-        # Build a rule-based Recommendation/Design/precaution note from
-        # the feature+reason text instead of leaving Column M without
-        # any mitigation guidance for this EDO.
+        # Expanded rule-based classification fallback engine
         if not recommendation_text:
             recommendation_text = _fallback_recommendation_text(
                 feature_text, reason_text, risk
@@ -3547,13 +3547,9 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
 def _fallback_observation_text(dfmea_text, risk):
     """
-    Rule-based fallback for the Observation block, used when the LLM
-    call in generate_remarks_and_recommendation() fails or returns a
-    non-answer. Scans the FMEA/RA&C trace text for an explicitly
-    stated risk word ('low'/'medium'/'high') that disagrees with the
-    already-assigned Risk Classification, and - if found - produces
-    the same fixed-wording Observation sentence the LLM prompt asks
-    for. Returns "" when no disagreeing level is found in the text.
+    Rule-based fallback for the Observation block when LLM fails.
+    Scans FMEA text for a stated risk word ('low'/'medium'/'high') that disagrees
+    with assigned Risk Classification.
     """
     if not dfmea_text or not risk:
         return ""
@@ -3566,9 +3562,8 @@ def _fallback_observation_text(dfmea_text, risk):
             continue
         if re.search(rf"\b{level}\b", text_lower):
             return (
-                f"Observation: In Sys-FMEA, the risk evaluation is "
-                f"'{level}'. recommended to change in the sys-FMEA as "
-                f"{assigned_lower}."
+                f"Observation: In Sys-FMEA, the risk evaluation is '{level}'. "
+                f"recommended to change in the sys-FMEA as {assigned_lower}."
             )
 
     return ""
@@ -3576,14 +3571,9 @@ def _fallback_observation_text(dfmea_text, risk):
 
 def _fallback_recommendation_text(feature_text, reason_text, risk):
     """
-    Rule-based fallback for the Recommendation/Design block, used when
-    the LLM call in generate_remarks_and_recommendation() fails or
-    returns a non-answer. Keyword-scans the feature/reason text to
-    pick the most relevant mitigation category (User Manual
-    warning/precaution, drawing/design note, or training) and drafts a
-    concrete note in the same house style the LLM prompt requests, so
-    Column M is never left without recommendation, observation,
-    warning, or precaution guidance for a real EDO record.
+    Richer, rule-based classification engine for Recommendations.
+    Matches product components against feature keywords and outputs exact-match
+    domain recommendations matching the house spreadsheet templates.
     """
     combined = f"{feature_text} {reason_text}".strip()
     if not combined:
@@ -3591,40 +3581,95 @@ def _fallback_recommendation_text(feature_text, reason_text, risk):
 
     combined_lower = combined.lower()
 
-    design_keywords = (
-        "drawing", "dimension", "load rating", "edo symbol",
-        "tolerance", "material spec", "part number", "mechanical"
+    POWER_CORD = (
+        "power cord", "electrical cord", "mains cable", "power supply cable", "plug"
     )
-    training_keywords = (
-        "training", "operator error", "user error", "misuse",
-        "improper use", "incorrect use"
+    HANDLE = (
+        "handle", "lifting", "load rating", "load capacity", "carrying handle"
+    )
+    HOSE = (
+        "hose", "tubing", "fluid line", "pneumatic tube", "connector hose"
+    )
+    CONTROL_UNIT = (
+        "control unit", "vibration", "stable surface", "placement", "inclined surface"
+    )
+    CARRY_CASE = (
+        "carrying case", "bag", "storage case", "enclosure case"
+    )
+    TRAINING = (
+        "training", "operator error", "user error", "misuse", "improper use", "incorrect use"
+    )
+    DESIGN = (
+        "drawing", "dimension", "tolerance", "material spec", "part number", "cad", "mechanical"
     )
 
-    if any(keyword in combined_lower for keyword in design_keywords):
+    # 1. Power Cord / Electrical Safety
+    if any(k in combined_lower for k in POWER_CORD):
         return (
-            "Design:\n"
-            f"Update the applicable drawing/design documentation to "
-            f"address the identified condition ({reason_text or feature_text}), "
-            "and add the corresponding EDO symbol/callout so the design "
-            "output is traceable on the drawing."
+            "Recommendation:\n\n"
+            "Recommended to include the following details in the user manual to mitigate potential power cord damage.\n\n"
+            "WARNING:\n"
+            "Proper Use and Handling of Power Cord\n"
+            "- Use only as instructed.\n"
+            "- Do not bend, twist or pull the power cord.\n"
+            "- Inspect regularly for damage.\n"
+            "- Replace immediately if damaged.\n"
+            "- Damaged cords may expose live electrical parts and cause electric shock."
         )
 
-    if any(keyword in combined_lower for keyword in training_keywords):
+    # 2. Handle / Load Ratings (Combined Design + User Manual)
+    if any(k in combined_lower for k in HANDLE):
         return (
-            "Recommendation:\n"
-            f"Provide operator/user training addressing the identified "
-            f"condition ({reason_text or feature_text}) to reduce the risk "
-            "of misuse."
+            "Recommendation:\n\n"
+            "It is recommended to include a drawing note specifying the maximum allowable load for the handle.\n\n"
+            "Additionally, include a caution statement in the user manual indicating that exceeding this load may result in handle failure."
         )
 
-    # Default: a User Manual warning/precaution note - the most common
-    # mitigation category for a Medium/High risk EDO with a feature or
-    # reason described but no LLM-drafted note available.
+    # 3. Control Unit Placement & Stability
+    if any(k in combined_lower for k in CONTROL_UNIT):
+        return (
+            "Recommendation to add in the User Manual:\n\n"
+            "The control unit should only be placed on a flat, stable surface during operation.\n"
+            "Do not place the unit on inclined or uneven surfaces.\n"
+            "Keep away from edges to prevent falling."
+        )
+
+    # 4. Carrying Case / Inspection
+    if any(k in combined_lower for k in CARRY_CASE):
+        return (
+            "Recommendation to add in the User Manual:\n\n"
+            "Inspect the carrying case for damage or wear before each transport. "
+            "Ensure all latches and zippers are fully secured prior to lifting."
+        )
+
+    # 5. Hose / Tubing / Connectors
+    if any(k in combined_lower for k in HOSE):
+        return (
+            "Recommendation:\n\n"
+            "Training shall be provided to users prior to handling and connecting the hoses to ensure proper and safe operation, "
+            "and appropriate caution notices shall be documented in the User Manual."
+        )
+
+    # 6. Training Specific
+    if any(k in combined_lower for k in TRAINING):
+        return (
+            "Recommendation:\n\n"
+            "Provide operator/user training addressing the identified condition to reduce the risk of misuse or incorrect operation."
+        )
+
+    # 7. Drawing / Engineering Design Specific
+    if any(k in combined_lower for k in DESIGN):
+        return (
+            "Design:\n\n"
+            f"Update the applicable drawing/design documentation to address the identified condition ({reason_text or feature_text}), "
+            "and add the corresponding EDO symbol/callout so the design output is traceable on the drawing."
+        )
+
+    # 8. General User Manual Fallback
     return (
-        "Recommendation to add in the User Manual:\n"
-        f"Warning/Precaution - {reason_text or feature_text}. Users must "
-        "be made aware of this condition and follow the applicable "
-        "precautions to avoid impact to product performance or safety."
+        "Recommendation to add in the User Manual:\n\n"
+        f"Warning/Precaution - {reason_text or feature_text}. Users must be made aware of this condition "
+        "and follow the applicable precautions to avoid impact to product performance or safety."
     )
 
 
