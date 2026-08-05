@@ -55,7 +55,7 @@ IMAGE_TEXT_OFFSET_PX = 45
 # the next available diagram from that queue, reserved for it ahead of
 # every other New EDO row - see format_edo_worksheet().
 TARGET_IMAGE_RA_NUMBER = "RA-141"
-TARGET_IMAGE_FMEA_NUMBER = "FMEA SYS-152"
+TARGET_IMAGE_FMEA_NUMBER = "FMEA Sys-152"
 
 
 # ==========================================================
@@ -3874,7 +3874,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
           For New EDO records specifically, the row whose RA_Number /
           FMEA_Number match TARGET_IMAGE_RA_NUMBER / TARGET_IMAGE_FMEA_NUMBER
-          (currently RA-141 / FMEA SYS-152) is guaranteed the next queued
+          (currently RA-141 / FMEA Sys-152) is guaranteed the next queued
           diagram, reserved for it before any other row can consume it.
           Every other New EDO row falls back to the same shared FIFO
           queue as before. Every case where Column H ends up with no
@@ -3890,7 +3890,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
     new_edo_diagram_queue = list(new_edo_diagram_queue) if new_edo_diagram_queue else []
     last_image_row = start_row
 
-    # ---- Reserve a diagram specifically for RA-141 / FMEA SYS-152 ----
+    # ---- Reserve a diagram specifically for RA-141 / FMEA Sys-152 ----
     # Guarantees that record gets an image even if other New EDO rows
     # come first in iteration order and would otherwise drain the FIFO
     # queue before reaching it.
@@ -3899,8 +3899,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
         for candidate_edo in final_edos.values():
             if (
                 candidate_edo.get("edo_type") == "New"
-                and normalize_id(candidate_edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
-                and normalize_id(candidate_edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+                and normalize_id(candidate_edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                and normalize_id(candidate_edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
             ):
                 reserved_target_image = new_edo_diagram_queue.pop(0)
                 logging.info(
@@ -3966,8 +3966,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             if is_new:
                 is_target_row = (
-                    normalize_id(edo.get("RA_Number")) == "RA-141"
-                    and normalize_id(edo.get("FMEA_Number")) == "FMEA SYS-152"
+                    normalize_id(edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                    and normalize_id(edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
                 )
 
                 if is_target_row:
@@ -4084,8 +4084,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             is_target_image_row = (
                 is_new
-                and normalize_id(edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
-                and normalize_id(edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+                and normalize_id(edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                and normalize_id(edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
             )
 
             if is_target_image_row and reserved_target_image:
