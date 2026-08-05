@@ -8,6 +8,7 @@ import unicodedata
 import zipfile
 import tempfile
 import hashlib
+import math
 import openpyxl
 import fitz
 
@@ -23,6 +24,7 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.utils.units import pixels_to_EMU
+from openpyxl.utils import get_column_letter
 
 from Files.database import DatabaseHandler
 from retrieval.retrieve_content_prompt import retrieve_content_for_prompt
@@ -45,6 +47,15 @@ IMAGE_HEIGHT = 110
 PDF_GLOBAL_OVERRIDE = os.path.join(CURRENT_FOLDER, "80369-6.pdf")
 IMAGE_OUTPUT_DIR = "extracted_images"
 IMAGE_TEXT_OFFSET_PX = 45
+
+# ---- New EDO diagram guaranteed-placement target ----
+# The New EDO diagram queue (see extract_new_edo_diagram_queue()) is
+# otherwise pure FIFO / content-blind. Per requirement, the row whose
+# RA_Number/FMEA_Number match this specific pair is guaranteed to get
+# the next available diagram from that queue, reserved for it ahead of
+# every other New EDO row - see format_edo_worksheet().
+TARGET_IMAGE_RA_NUMBER = "RA-141"
+TARGET_IMAGE_FMEA_NUMBER = "FMEA SYS-152"
 
 
 # ==========================================================
@@ -219,6 +230,17 @@ CAPTION_FIGURE_PATTERN = re.compile(r'as\s+below\s*:', re.IGNORECASE)
 CAPTION_TABLE_PATTERN = re.compile(r'^\s*table\s+\d+', re.IGNORECASE)
 EXCLUDED_LOGO_KEYWORDS = ["hillrom"]
 
+# ---- Last-figure marker ----
+# Per requirement, the figure captioned "For 211651, the hose metal ring
+# dimension is controlled as below:" is the last real figure that should
+# ever be extracted/printed. Duplicates are otherwise allowed as before,
+# but once THIS specific figure is reached, nothing after it in the
+# document is retrieved - see is_last_figure_caption() /
+# extract_docx_figures_only().
+LAST_FIGURE_CAPTION_PATTERN = re.compile(
+    r'211651.*hose\s+metal\s+ring', re.IGNORECASE | re.DOTALL
+)
+
 def _extract_paragraph_texts_and_images(doc_xml):
     """
     Splits word/document.xml into paragraphs (<w:p>...</w:p> blocks),
@@ -282,6 +304,15 @@ def is_excluded_logo(caption_text):
     return any(keyword in lowered for keyword in EXCLUDED_LOGO_KEYWORDS)
 
 
+def is_last_figure_caption(caption_text):
+    """
+    True when `caption_text` is the "For 211651, the hose metal ring
+    dimension is controlled as below:" caption - the figure that must be
+    the LAST one ever extracted. See LAST_FIGURE_CAPTION_PATTERN.
+    """
+    return bool(LAST_FIGURE_CAPTION_PATTERN.search(caption_text or ""))
+
+
 def extract_docx_figures_only(docx_file):
     """
     CANONICAL image extractor used by extract_edo_proposed_images().
@@ -290,6 +321,13 @@ def extract_docx_figures_only(docx_file):
     (duplicates allowed/retrieved), and only those with a "Figure N"
     caption nearby are kept - "Table N" captions, uncaptioned images, and
     anything mentioning "Hillrom" are all excluded.
+
+    Per requirement, the figure captioned "For 211651, the hose metal
+    ring dimension is controlled as below:" is treated as the LAST real
+    figure in the document - once it's been extracted, nothing appearing
+    after it is retrieved (see LAST_FIGURE_CAPTION_PATTERN /
+    is_last_figure_caption()), even though duplicates before that point
+    are still allowed as before.
     """
     logging.info("READING WORD MEDIA IMAGES (FIGURES ONLY)")
 
@@ -324,8 +362,12 @@ def extract_docx_figures_only(docx_file):
         skipped_table = 0
         skipped_logo = 0
         skipped_uncaptioned = 0
+        reached_last_figure = False
 
         for para_index, para in enumerate(paragraphs):
+            if reached_last_figure:
+                break
+
             for embed_id in para["embed_ids"]:
                 filename = rel_map.get(embed_id)
                 if not filename or filename not in media_bytes:
@@ -356,6 +398,16 @@ def extract_docx_figures_only(docx_file):
                     "caption": caption
                 })
                 logging.info(f"FIGURE FOUND : {filename} - caption: {caption!r}")
+
+                if is_last_figure_caption(caption):
+                    reached_last_figure = True
+                    logging.info(
+                        "LAST FIGURE REACHED - caption "
+                        f"{caption!r} matches the 211651 hose metal ring "
+                        "marker; no further images later in the document "
+                        "will be extracted."
+                    )
+                    break
 
     logging.info(
         f"TOTAL FIGURES EXTRACTED : {len(figures)}  "
@@ -1403,9 +1455,17 @@ def extract_existing_edo_trace_details(
     below the existing RA/FMEA data, in the same row (see
     apply_existing_edo_trace() and the Column D value construction in
     format_edo_worksheet()).
+
+    CHANGED: now issues ONE LLM call PER EDO instead of a single batched
+    call covering all EDOs at once. The batched version could get cut
+    short mid-way through the response (partial results - some EDOs'
+    tags missing or truncated), because all RA/FMEA targets shared one
+    fixed max_tokens budget. Calling per-EDO gives each EDO its own full
+    output budget and means one bad/oversized row can't blank out the
+    rest of the batch.
     """
     logging.info("=" * 80)
-    logging.info("STAGE 3C: EXISTING EDO - TRACE EXTRACTION")
+    logging.info("STAGE 3C: EXISTING EDO - TRACE EXTRACTION (per-EDO calls)")
     logging.info("=" * 80)
 
     if "edo_fmea" not in edo_document:
@@ -1423,58 +1483,131 @@ def extract_existing_edo_trace_details(
         db
     )
 
-    targets = "\n".join(
-        f"RA_Number : {edo.get('ra_number')}\nFMEA_Number : {edo.get('FMEA_Number')}"
-        for edo in existing_edos.values()
-        if edo.get("ra_number") not in (None, "", "Blank") or edo.get("FMEA_Number") not in (None, "", "Blank")
-    )
+    results = {}
 
-    if not targets:
-        logging.warning(
-            "No RA/FMEA numbers available on any existing EDO - skipping "
-            "trace extraction."
+    for edo_tag, edo in existing_edos.items():
+        ra_number = edo.get("ra_number")
+        fmea_number = edo.get("FMEA_Number")
+
+        has_ra = ra_number not in (None, "", "Blank")
+        has_fmea = fmea_number not in (None, "", "Blank")
+
+        if not has_ra and not has_fmea:
+            logging.info(
+                f"extract_existing_edo_trace_details: {edo_tag} has no "
+                "RA/FMEA number - skipping (empty traces)."
+            )
+            results[edo_tag] = {"traces": []}
+            continue
+
+        target = (
+            f"EDO : {edo_tag}\n"
+            f"RA_Number : {ra_number}\n"
+            f"FMEA_Number : {fmea_number}"
         )
-        return {}
 
-    prompt_row = {
-        "prompt_role": prompt_data["prompt_role"],
-        "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + targets,
-        "question": "Fetch trace records for the folowing sys number <FMEA_Number> number",
-        "fulltext": "Yes",
-        "where_filter": "",
-        "where_document": "",
-        "checkpoint": ""
-    }
+        prompt_row = {
+            "prompt_role": prompt_data["prompt_role"],
+            "prompt_text": prompt_data["prompt_text"] + "\nTARGET:\n" + target,
+            "question": f"Fetch all trace records for {edo_tag} (FMEA_Number: {fmea_number})",
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": '{"$contains": "Safety Hazard DFMEA Table" }',
+            "checkpoint": ""
+        }
 
-    _, _, response = execute_llm_retry(
-        pipeline_config,
-        edo_document["edo_fmea"]["collection"],
-        prompt_row
-    )
+        try:
+            _, _, response = execute_llm_retry(
+                pipeline_config,
+                edo_document["edo_fmea"]["collection"],
+                prompt_row
+            )
+        except Exception as call_error:
+            logging.warning(
+                f"extract_existing_edo_trace_details: LLM call failed for "
+                f"{edo_tag} after retries - leaving traces empty. "
+                f"Reason: {call_error}"
+            )
+            results[edo_tag] = {"traces": []}
+            continue
 
+        edo_result = _parse_single_edo_trace_response(edo_tag, response)
+        results[edo_tag] = edo_result
+
+        logging.info(
+            f"extract_existing_edo_trace_details: {edo_tag} -> "
+            f"{len(edo_result.get('traces', []))} trace(s) extracted."
+        )
+
+    logging.info("========== PER-EDO TRACE RESULTS (COMBINED) ==========")
+    logging.info(json.dumps(results, indent=2))
+
+    return results
+
+
+def _parse_single_edo_trace_response(edo_tag, response):
+    """
+    Parses ONE EDO's raw LLM response into {"traces": [str, ...]}.
+    Tries, in order:
+      1. Direct JSON parse (parse_json / clean_llm_response), expecting
+         either {"traces": [...]} or {"<edo_tag>": {"traces": [...]}}.
+      2. Fenced ```json code blocks (extract_json_code_blocks).
+      3. Markdown fallback (parse_markdown_trace_response) - repurposed
+         here to just pull bullet lines out, since we now only care
+         about the plain "<Document#>: <Tag#>" strings.
+    Always returns a dict with a "traces" list (possibly empty), never
+    raises - a parse failure just means empty traces for that one EDO,
+    not a loss of the whole run.
+    """
     parsed = parse_json(response)
-    if deep_extract_records(parsed):
-        return parsed
+
+    def normalize_result(obj):
+        if isinstance(obj, dict):
+            if "traces" in obj and isinstance(obj["traces"], list):
+                traces = [normalize_text(t) for t in obj["traces"] if normalize_text(t)]
+                return {"traces": traces}
+            if edo_tag in obj and isinstance(obj[edo_tag], dict):
+                return normalize_result(obj[edo_tag])
+            # single-key dict wrapping the real payload, e.g. {"EDO-29": {...}}
+            for v in obj.values():
+                if isinstance(v, dict) and "traces" in v:
+                    return normalize_result(v)
+        return None
+
+    result = normalize_result(parsed)
+    if result is not None:
+        return result
 
     code_block_records = extract_json_code_blocks(response)
-    if code_block_records:
-        logging.warning(
-            "extract_existing_edo_trace_details: LLM response wasn't a "
-            f"single valid JSON document - recovered {len(code_block_records)} "
-            "record(s) from individual ```json fenced blocks."
-        )
-        return code_block_records
+    for block in code_block_records:
+        result = normalize_result(block)
+        if result is not None:
+            logging.warning(
+                f"_parse_single_edo_trace_response: {edo_tag} recovered via "
+                "fenced ```json code block fallback."
+            )
+            return result
 
     markdown_records = parse_markdown_trace_response(response)
     if markdown_records:
-        logging.warning(
-            "extract_existing_edo_trace_details: LLM response wasn't "
-            "valid JSON (or contained no records) - recovered "
-            f"{len(markdown_records)} record(s) via Markdown fallback parser."
-        )
-        return markdown_records
+        traces = []
+        for rec in markdown_records:
+            module_controls = rec.get("Traces to Module DFMEA risk controls")
+            if isinstance(module_controls, list):
+                traces.extend(normalize_text(t) for t in module_controls if normalize_text(t))
+        if traces:
+            logging.warning(
+                f"_parse_single_edo_trace_response: {edo_tag} recovered via "
+                "Markdown fallback parser."
+            )
+            return {"traces": traces}
 
-    return parsed
+    logging.warning(
+        f"_parse_single_edo_trace_response: {edo_tag} - could not parse any "
+        "traces from the LLM response. Raw response logged below."
+    )
+    logging.warning(response)
+    return {"traces": []}
 
 
 def extract_json_code_blocks(text):
@@ -1592,190 +1725,68 @@ def parse_markdown_trace_response(response):
 
 def apply_existing_edo_trace(existing_edos, trace_details):
     """
-    ADDED - couples the trace records back onto existing_edos by RA/FMEA
-    number. Matching is format-tolerant (case/whitespace normalized, plus
-    substring containment). Populates edo["existing_trace"], which is then appended
-    below the RA/FMEA data already shown in Column D (dfmea), same row -
-    see format_edo_worksheet().
-    """
-    records = deep_extract_records(trace_details)
-    logging.info(f"apply_existing_edo_trace: {len(records)} raw trace record(s) extracted from LLM response.")
+    ADDED - couples the trace records back onto existing_edos.
 
+    CHANGED: the EDO_Existing_Trace prompt's response (from the per-EDO
+    extract_existing_edo_trace_details above) is now keyed DIRECTLY by
+    EDO tag - {"EDO-29": {"traces": [...]}, "EDO-31": {"traces": []}, ...}
+    - matching existing_edos' own keys exactly (existing_edos is itself
+    keyed by edo_tag, e.g. existing_edos["EDO-29"]).
+
+    Previously this went through deep_extract_records() + RA/FMEA-number
+    matching, which only worked for a different response shape (a flat
+    list of {RA_Number, FMEA_Number, ...} records). Against the current
+    dict-of-EDO-tag response, deep_extract_records() returned an empty
+    list every time (no recognized container key, and "traces" holds
+    plain strings rather than dicts) - so existing_trace was NEVER
+    populated and nothing reached the Excel output, even though the LLM
+    logs showed correct answers. This version matches by EDO tag
+    directly instead.
+    """
     matched_count = 0
 
-    def build_trace_text(row):
-        """
-        Builds a readable trace string from the EDO_Existing_Trace prompt's
-        actual response shape:
-          - "Traces to Module DFMEA risk controls": list of
-            {document_number, tag_number, cause}
-          - "Additional Risk Control Measures from Module and/or Component
-            DFMEAs": list of identifier strings
-          - "DRS Identifiers": list of identifier strings
-        Falls back to the older plain-string key names in case the prompt
-        output format varies.
-        """
-        parts = []
-
-        module_controls = row.get("Traces to Module DFMEA risk controls")
-        if isinstance(module_controls, list):
-            for item in module_controls:
-                if isinstance(item, dict):
-                    doc = normalize_text(item.get("document_number"))
-                    tag = normalize_text(item.get("tag_number"))
-                    cause = normalize_text(item.get("cause"))
-                    line = " ".join(p for p in [doc, tag] if p)
-                    if cause:
-                        line = f"{line} - {cause}" if line else cause
-                    if line:
-                        parts.append(line)
-                elif normalize_text(item):
-                    parts.append(normalize_text(item))
-
-        additional_measures = row.get("Additional Risk Control Measures from Module and/or Component DFMEAs")
-        if isinstance(additional_measures, list):
-            parts.extend(normalize_text(m) for m in additional_measures if normalize_text(m))
-
-        drs_identifiers = row.get("DRS Identifiers")
-        if isinstance(drs_identifiers, list):
-            parts.extend(normalize_text(d) for d in drs_identifiers if normalize_text(d))
-
-        # NEW - current EDO_Existing_Trace prompt output collapses everything
-        # into a single "traces" key instead of the three separate keys
-        # above. This is what's actually coming back now (see the
-        # "no recognized trace-text key ... Raw keys present: ['RA_Number',
-        # 'FMEA_Number', 'traces']" warning) - handle it generically since
-        # the items inside can be dicts (with varying field names) or plain
-        # strings, and "traces" itself can be a list or a dict of lists.
-        def flatten_trace_item(item):
-            if isinstance(item, dict):
-                doc = normalize_text(
-                    item.get("document_number") or item.get("Document_Number")
-                    or item.get("System DFMEA #") or item.get("system_dfmea")
-                    or ""
-                )
-                tag = normalize_text(
-                    item.get("tag_number") or item.get("Tag_Number")
-                    or item.get("Trace To RAC#") or item.get("ra_number")
-                    or ""
-                )
-                cause = normalize_text(
-                    item.get("cause") or item.get("Cause")
-                    or item.get("description") or item.get("Description")
-                    or ""
-                )
-                line = " ".join(p for p in [doc, tag] if p)
-                if cause:
-                    line = f"{line} - {cause}" if line else cause
-                if not line:
-                    # last resort - stitch together whatever scalar values
-                    # the dict actually has so nothing is silently dropped.
-                    line = " ".join(
-                        normalize_text(v) for v in item.values()
-                        if isinstance(v, (str, int, float)) and normalize_text(v)
-                    )
-                return line
-            return normalize_text(item)
-
-        traces_field = row.get("traces") or row.get("Traces")
-        if traces_field:
-            if isinstance(traces_field, list):
-                for item in traces_field:
-                    line = flatten_trace_item(item)
-                    if line:
-                        parts.append(line)
-            elif isinstance(traces_field, dict):
-                for v in traces_field.values():
-                    if isinstance(v, list):
-                        for item in v:
-                            line = flatten_trace_item(item)
-                            if line:
-                                parts.append(line)
-                    elif v:
-                        line = flatten_trace_item(v)
-                        if line:
-                            parts.append(line)
-            elif isinstance(traces_field, str):
-                t = normalize_text(traces_field)
-                if t:
-                    parts.append(t)
-
-        if parts:
-            return "\n".join(parts)
-
-        # Fallback - older plain-string key names, kept for compatibility.
-        return normalize_text(
-            row.get("Trace")
-            or row.get("Trace_Reference")
-            or row.get("Trace Reference")
-            or row.get("trace_reference")
-            or row.get("RA_and_FMEA_Trace")
-            or row.get("Traceability")
-            or row.get("Trace_Text")
-            or row.get("Trace Text")
-            or row.get("Trace_Details")
-            or row.get("Trace Details")
-            or row.get("Trace_Value")
-            or row.get("trace")
-            or row.get("RA_FMEA_Trace")
-            or row.get("Sys_DFMEA_Trace")
-            or row.get("DFMEA_Trace")
+    if not isinstance(trace_details, dict):
+        logging.warning(
+            "apply_existing_edo_trace: trace_details was not a dict "
+            f"(got {type(trace_details).__name__}) - nothing to apply."
         )
+        return existing_edos
 
-    for row in records:
+    for raw_tag, row in trace_details.items():
         if not isinstance(row, dict):
             continue
 
-        trace_fmea = normalize_id(
-            row.get("System DFMEA #")
-            or row.get("FMEA_Number")
-            or row.get("FMEA Number")
-            or ""
-        )
-        trace_ra = normalize_id(
-            row.get("Trace To RAC#")
-            or row.get("RA_Number")
-            or row.get("RA Number")
-            or ""
-        )
+        # Format-tolerant lookup: exact key, then case-insensitive match
+        # against existing_edos' own keys.
+        edo = existing_edos.get(raw_tag)
+        if edo is None:
+            normalized_tag = normalize_text(raw_tag).lower()
+            for key, candidate in existing_edos.items():
+                if normalize_text(key).lower() == normalized_tag:
+                    edo = candidate
+                    break
 
-        trace_value = build_trace_text(row)
-        if not trace_value or trace_value.lower() == "none":
-            # DIAGNOSTIC: if this fires for every record, the LLM's JSON key
-            # name for the trace text doesn't match any key checked above -
-            # this log line shows the actual keys so the list can be updated.
+        if edo is None:
             logging.warning(
-                f"apply_existing_edo_trace: no recognized trace-text key on "
-                f"record RA={trace_ra!r} FMEA={trace_fmea!r}. Raw keys present: "
-                f"{list(row.keys())}"
+                f"apply_existing_edo_trace: no existing EDO found matching "
+                f"key {raw_tag!r} - skipping."
             )
             continue
 
-        row_matched = False
-        for edo in existing_edos.values():
-            edo_fmea = normalize_id(edo.get("FMEA_Number") or "")
-            edo_ra = normalize_id(edo.get("ra_number") or "")
+        traces = row.get("traces") or row.get("Traces") or []
+        lines = [normalize_text(t) for t in traces if isinstance(t, str) and normalize_text(t)]
 
-            fmea_match = trace_fmea and edo_fmea and (trace_fmea == edo_fmea or trace_fmea in edo_fmea or edo_fmea in trace_fmea)
-            ra_match = trace_ra and edo_ra and (trace_ra == edo_ra or trace_ra in edo_ra or edo_ra in trace_ra)
+        if lines:
+            edo["existing_trace"] = "\n".join(lines)
+            matched_count += 1
+        else:
+            edo["existing_trace"] = ""
 
-            if fmea_match or ra_match:
-                edo["existing_trace"] = trace_value
-                row_matched = True
-                matched_count += 1
-
-        if not row_matched:
-            # DIAGNOSTIC: trace text was found, but couldn't be matched to
-            # any existing EDO's RA/FMEA number - shows the mismatch so the
-            # normalize_id() comparison can be adjusted if needed.
-            logging.warning(
-                f"apply_existing_edo_trace: trace text found for "
-                f"RA={trace_ra!r} FMEA={trace_fmea!r} but it matched no "
-                f"existing EDO (available RA/FMEA on existing_edos: "
-                f"{[(e.get('ra_number'), e.get('FMEA_Number')) for e in existing_edos.values()]})."
-            )
-
-    logging.info(f"apply_existing_edo_trace: populated existing_trace on {matched_count} existing-EDO match(es).")
+    logging.info(
+        f"apply_existing_edo_trace: populated existing_trace on "
+        f"{matched_count} existing-EDO match(es) out of {len(trace_details)} "
+        "trace response(s)."
+    )
 
     return existing_edos
 
@@ -1891,6 +1902,227 @@ def extract_new_edo_tags(
     logging.info(
         f"extract_new_edo_tags: consolidated {len(edo_new_data)} RA id(s) "
         f"into edo_new_data."
+    )
+
+    return edo_new_data
+
+
+def filter_new_edo_by_risk_evaluation(
+    client,
+    product_family,
+    product,
+    templatename,
+    pipeline_config,
+    edo_document,
+    edo_new_data,
+    db
+):
+    """
+    STEP 1.5 of 3 (runs AFTER extract_new_edo_tags / CALL 4 and BEFORE
+    extract_new_edo_summary_details / CALL 5).
+
+    For every RA_Number/FMEA_Number pair already collected in
+    edo_new_data, looks up that record's "Risk Evaluation" column in
+    the EDO_FMEA document (one LLM call per record, same pattern as
+    extract_new_edo_summary_details below). Only entries whose Risk
+    Evaluation is "Medium" (case-insensitive) are kept in edo_new_data;
+    every entry with any other Risk Evaluation value - or where it
+    could not be determined at all - is removed from edo_new_data
+    before it is enriched or written anywhere.
+    """
+    logging.info("=" * 80)
+    logging.info("STAGE 4a-2: WORKFLOW 2 - NEW EDO RISK EVALUATION FILTER (Medium only)")
+    logging.info("=" * 80)
+
+    if not edo_new_data:
+        logging.info("No new EDO tags to filter by risk evaluation.")
+        return edo_new_data
+
+    try:
+        prompt_data = db.get_prompt_by_name(
+            client,
+            product_family,
+            product,
+            templatename,
+            "EDO_NEW_risk_evaluation"
+        )
+    except Exception as e:
+        logging.error(
+            "RISK EVALUATION FILTER SKIPPED - could not load the "
+            f"'EDO_NEW_risk_evaluation' prompt: {e}. Leaving edo_new_data "
+            "unfiltered for this run."
+        )
+        return edo_new_data
+
+    keys_to_remove = []
+
+    # Every RA/FMEA pair already present in edo_new_data (normalized), so
+    # the "other Medium row" objects returned by the LLM (see instruction 3
+    # of the updated EDO_NEW_risk_evaluation prompt) never get added twice -
+    # either as a duplicate of an existing entry, or twice across two
+    # different target lookups that both happen to surface the same row.
+    seen_pairs = {
+        (
+            normalize_text(e.get("RA_Number", "")).strip().lower(),
+            normalize_text(e.get("FMEA_Number", "")).strip().lower()
+        )
+        for e in edo_new_data.values()
+    }
+
+    # New entries discovered as "other Medium rows". Collected separately
+    # and merged into edo_new_data only after the main loop finishes, since
+    # we must not mutate edo_new_data while iterating over it.
+    entries_to_add = {}
+
+    for key, entry in edo_new_data.items():
+        ra_number = entry.get("RA_Number", "")
+        fmea_number = entry.get("FMEA_Number", "")
+
+        target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+
+        prompt_row = {
+            "prompt_role": prompt_data["prompt_role"],
+            "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
+            "question": (
+                f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
+                "extract the Risk Evaluation value as the first JSON "
+                "object, plus - per instruction 3 - a JSON object for "
+                "every OTHER row in this FMEA whose Risk Evaluation is "
+                "'Medium'."
+            ),
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": "",
+            "checkpoint": ""
+        }
+
+        logging.info(
+            f"--- DEBUG RISK EVALUATION LOOKUP for RA={ra_number!r} "
+            f"FMEA={fmea_number!r} ---"
+        )
+
+        risk_evaluation = ""
+        other_medium_rows = []
+        try:
+            docs, metadata, response = execute_llm_retry(
+                pipeline_config,
+                edo_document["edo_fmea"]["collection"],
+                prompt_row
+            )
+
+            parsed = parse_json(response)
+            records = deep_extract_records(parsed)
+            if not records and isinstance(parsed, dict):
+                records = [parsed]
+
+            detail_row = records[0] if records else {}
+
+            risk_evaluation = normalize_text(
+                get_llm_value(
+                    detail_row,
+                    "Risk_Evaluation",
+                    "Risk Evaluation",
+                    "risk_evaluation"
+                )
+            )
+
+            # Everything after the first record is an "other Medium row"
+            # per instruction 3 of the prompt.
+            other_medium_rows = records[1:] if len(records) > 1 else []
+
+        except Exception as e:
+            logging.error(
+                f"RISK EVALUATION lookup failed for RA={ra_number!r} "
+                f"FMEA={fmea_number!r}: {e}"
+            )
+            risk_evaluation = ""
+            other_medium_rows = []
+
+        entry["Risk_Evaluation"] = risk_evaluation
+
+        if risk_evaluation.strip().lower() != "medium":
+            logging.info(
+                f"RISK EVALUATION FILTER: excluding RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - Risk Evaluation is "
+                f"{risk_evaluation!r} (not 'Medium')."
+            )
+            keys_to_remove.append(key)
+        else:
+            logging.info(
+                f"RISK EVALUATION FILTER: keeping RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - Risk Evaluation is 'Medium'."
+            )
+
+        # ---- Fold in any "other Medium row" objects the LLM returned ----
+        for other_row in other_medium_rows:
+            if not isinstance(other_row, dict):
+                continue
+
+            other_ra = normalize_text(
+                get_llm_value(other_row, "RA_Number", "RA Number", "ra_number")
+            )
+            other_fmea = normalize_text(
+                get_llm_value(other_row, "FMEA_Number", "FMEA Number", "fmea_number")
+            )
+            other_risk = normalize_text(
+                get_llm_value(
+                    other_row,
+                    "Risk_Evaluation",
+                    "Risk Evaluation",
+                    "risk_evaluation"
+                )
+            )
+
+            if other_risk.strip().lower() != "medium":
+                # Prompt already asks for Medium-only extras, but guard
+                # against the LLM including a non-Medium row anyway.
+                continue
+
+            if not other_ra and not other_fmea:
+                continue
+
+            dedupe_key = (other_ra.strip().lower(), other_fmea.strip().lower())
+            if dedupe_key in seen_pairs:
+                logging.info(
+                    "RISK EVALUATION FILTER: skipping duplicate other-Medium "
+                    f"row RA={other_ra!r} FMEA={other_fmea!r} - already in "
+                    "edo_new_data."
+                )
+                continue
+
+            seen_pairs.add(dedupe_key)
+            new_key = other_ra or other_fmea or f"NEW-EDO-RISK-MEDIUM-{len(entries_to_add) + len(edo_new_data)}"
+            if new_key in edo_new_data or new_key in entries_to_add:
+                new_key = f"{new_key}_{len(entries_to_add)}"
+
+            entries_to_add[new_key] = {
+                "RA_Number": other_ra,
+                "FMEA_Number": other_fmea,
+                "Status": entry.get("Status", ""),
+                "Risk_Evaluation": "Medium"
+            }
+
+            logging.info(
+                "RISK EVALUATION FILTER: adding other-Medium row "
+                f"RA={other_ra!r} FMEA={other_fmea!r} to edo_new_data "
+                f"(discovered while looking up RA={ra_number!r} "
+                f"FMEA={fmea_number!r})."
+            )
+
+    for key in keys_to_remove:
+        del edo_new_data[key]
+
+    # Merge the newly discovered "other Medium row" entries into
+    # edo_new_data so they flow through the rest of the New EDO pipeline
+    # (summary details, traceability, verification, merge) exactly like
+    # any other new-EDO record.
+    edo_new_data.update(entries_to_add)
+
+    logging.info(
+        f"RISK EVALUATION FILTER complete: {len(edo_new_data)} entr"
+        f"{'y' if len(edo_new_data) == 1 else 'ies'} remaining "
+        f"({len(keys_to_remove)} excluded for non-Medium risk evaluation, "
+        f"{len(entries_to_add)} other-Medium row(s) added)."
     )
 
     return edo_new_data
@@ -2492,6 +2724,137 @@ def validate_final_edos(final_edos):
 # instead of the old two separate bulk calls (one for Existing, one for
 # New).
 
+VERIFICATION_LABELED_LINE_PATTERN = re.compile(
+    r'^\s*(?P<prefix>\([^)]*\))?\s*'
+    r'Source\s*:\s*(?P<source>.*?)\s*'
+    r'(?:\|\s*Location\s*:\s*(?P<location>.*?)\s*)?'
+    r'(?:\|\s*File\s*:\s*(?P<file>.*?)\s*)?'
+    r'(?:\|\s*Result\s*:\s*(?P<result>.*?)\s*)?$',
+    re.IGNORECASE
+)
+
+
+def clean_verification_reference_line(line):
+    """
+    Per requirement: a raw Verification_Reference line shaped like
+        "(DRS-570) Source: Vest APX ... .xlsx | Location: NPD45678 ... | File: ... | Result: PASS"
+    is stripped down to just the trace code (if present) plus the
+    Location and File values - the "Source:" and "Result:" labels/
+    values are dropped entirely, and no label text is printed at all:
+        "(DRS-570) NPD45678 Vest APX System Verification Traceability Report ..."
+    A line that doesn't match this labeled "Source: ... | Location: ...
+    | File: ... | Result: ..." shape is returned unchanged, so genuine
+    free-form verification text still prints as-is.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return stripped
+
+    match = VERIFICATION_LABELED_LINE_PATTERN.match(stripped)
+    if not match:
+        return stripped
+
+    prefix = normalize_text(match.group("prefix"))
+    location = normalize_text(match.group("location"))
+    file_name = normalize_text(match.group("file"))
+
+    body = " ".join(part for part in [location, file_name] if part)
+    if not body:
+        # Nothing usable besides the label text itself - fall back to
+        # the original line rather than printing an empty result.
+        return stripped
+
+    return f"{prefix} {body}".strip() if prefix else body
+
+
+def clean_verification_reference_text(raw_text):
+    """
+    Applies clean_verification_reference_line() to every line of a
+    (possibly multi-line, multi-code) raw Verification_Reference value.
+    """
+    if not raw_text:
+        return raw_text
+    lines = [ln for ln in raw_text.split("\n") if ln.strip()]
+    return "\n".join(clean_verification_reference_line(ln) for ln in lines)
+
+
+# BUGFIX: the LLM sometimes answers with its own search narration or a
+# plain "I couldn't find anything" statement - e.g. "Searching in RA
+# document for RA_Number 12345, no verification reference found." -
+# instead of either a real reference or the literal word "None". The
+# only guard before this was `verification.lower() != "none"`, so that
+# narration text passed straight through and got written into Column E
+# as if it were real data. NON_ANSWER_VERIFICATION_PATTERN recognizes
+# this shape of response so it can be discarded like "None" already is.
+NON_ANSWER_VERIFICATION_PATTERN = re.compile(
+    r'^\s*(searching|search(?:ed|ing)?\s+(?:in|the|for)|no\s+(?:verification|reference|'
+    r'matching|relevant|explicit)|not\s+found|unable\s+to\s+(?:find|locate)|'
+    r'could\s+not\s+(?:find|locate)|no\s+(?:information|data|match|result)|'
+    r'not\s+(?:available|mentioned|provided|present)|n/?a)\b',
+    re.IGNORECASE
+)
+
+
+def is_non_answer_verification_text(text):
+    """
+    True when `text` reads like the LLM describing its search process or
+    reporting that it found nothing (see NON_ANSWER_VERIFICATION_PATTERN),
+    rather than an actual Verification Reference value that should be
+    written to Column E.
+    """
+    return bool(NON_ANSWER_VERIFICATION_PATTERN.match((text or "").strip()))
+
+
+# BUGFIX: EDO_RA_C is the Risk Assessment and Control document itself,
+# not a verification/test report - it has no genuine "Verification
+# Reference" field. When a record is searched there via the RA_Number-
+# only fallback and no real reference exists, the search still returns
+# a labeled line pointing back at the RA&C document's own identity, e.g.
+# "NPD36702 Vest APX Risk Assessment and Control RA-124" - the RA&C
+# document's own Location/File name, not a distinct verification code.
+# This is self-referential noise ("this is the document I searched"),
+# not data, and must not be written to Column E.
+#
+# NARROWED: only treat this as self-referential noise when the "Risk
+# Assessment and Control" phrase is immediately followed by THIS
+# record's own RA_Number (i.e. it's just echoing back what was
+# searched for). Previously ANY answer containing that phrase was
+# discarded, which also threw away genuinely distinct verification
+# text that happened to mention it (e.g. a real reference quoting the
+# RA&C document's title alongside its own separate report number) -
+# that over-filtering was blanking Column E for records that actually
+# had a real answer.
+SELF_REFERENTIAL_RA_DOCUMENT_PATTERN = re.compile(
+    r'risk\s+assessment\s+(?:and|&)\s+control\s*[-:]?\s*(RA[\s-]?\d+|\d+)',
+    re.IGNORECASE
+)
+
+
+def is_self_referential_ra_document_text(text, ra_number=""):
+    """
+    True when `text` is just the RA&C document naming itself back using
+    THIS record's own RA_Number (e.g. searched for "RA-124" and got back
+    "... Risk Assessment and Control RA-124") rather than a genuine,
+    distinct Verification Reference. Only fires when the number right
+    after "Risk Assessment and Control" matches `ra_number` - if it's a
+    different number, or there's no `ra_number` to compare against, this
+    returns False so real data is never discarded.
+    """
+    if not text:
+        return False
+
+    match = SELF_REFERENTIAL_RA_DOCUMENT_PATTERN.search(text)
+    if not match:
+        return False
+
+    if not ra_number:
+        return False
+
+    found_digits = re.sub(r"\D", "", match.group(1))
+    target_digits = re.sub(r"\D", "", ra_number)
+    return bool(found_digits) and found_digits == target_digits
+
+
 def extract_and_apply_verification_details(
     client,
     product_family,
@@ -2505,11 +2868,30 @@ def extract_and_apply_verification_details(
     """
     CALL 6 - for every record in the already-merged `final_edos` dict
     (Existing + New together), use its RA_Number/FMEA_Number to search
-    ONLY the FMEA document (falling back to RA&C if FMEA isn't
-    configured) and extract the Verification Reference - ONE LLM call
-    per record, same loop-per-entry pattern as
-    extract_new_edo_summary_details(). Writes the result straight onto
-    each record's "verification_reference" field and returns final_edos.
+    for the Verification Reference and write it onto each record's
+    "verification_reference" field - ONE (or, on fallback, two) LLM
+    call(s) per record, same loop-per-entry pattern as
+    extract_new_edo_summary_details(). Returns final_edos.
+
+    OR fallback (BUGFIX): previously a record only ever searched
+    EDO_RA_C instead of EDO_FMEA when FMEA_Number was textually blank -
+    if FMEA_Number WAS present but the EDO_FMEA document simply had no
+    entry for it (a very common case even with FMEA configured), the
+    record was left with nothing and Column E came back blank even
+    though EDO_RA_C was fully available and configured. Now every
+    record with an FMEA_Number tries EDO_FMEA first, and EDO_RA_C (via
+    RA_Number alone) is tried right after as a genuine OR fallback
+    whenever EDO_FMEA comes back with no usable answer - not only when
+    FMEA_Number was missing to begin with.
+
+    A non-answer is filtered out before accepting either source's
+    response: the LLM's own search narration ("Searching in RA
+    document...", "No verification reference found.", etc. - see
+    is_non_answer_verification_text()). Per requirement, EDO_RA_C's
+    Location/File identification of itself (e.g. "NPD36702 Vest APX Risk
+    Assessment and Control RA-124") is printed to Column E as-is when
+    that's all EDO_RA_C has for this record - it is no longer treated as
+    a non-answer.
     """
     logging.info("=" * 80)
     logging.info("CALL 6: UNIFIED VERIFICATION REFERENCE EXTRACTION (POST-MERGE, PER-RECORD)")
@@ -2519,16 +2901,7 @@ def extract_and_apply_verification_details(
         logging.info("No merged EDO records to extract verification details for.")
         return final_edos
 
-    if "edo_fmea" in edo_document:
-        verification_source_key = "edo_fmea"
-    elif "edo_ra_c" in edo_document:
-        logging.warning(
-            "EDO_FMEA document/collection not found in edo_document - "
-            "falling back to EDO_RA_C (RA&C) as the document identity "
-            "for verification reference extraction."
-        )
-        verification_source_key = "edo_ra_c"
-    else:
+    if "edo_fmea" not in edo_document and "edo_ra_c" not in edo_document:
         raise Exception(
             "Neither EDO_FMEA nor EDO_RA_C document/collection is "
             "configured - cannot run verification reference extraction."
@@ -2542,6 +2915,238 @@ def extract_and_apply_verification_details(
         "EDO_NEW_Verification_details",
         db
     )
+
+    def _query_verification_reference(source_key, ra_number, fmea_number, ra_only):
+        """
+        Runs the CALL 6 verification-reference prompt against a single
+        source document/collection (edo_fmea or edo_ra_c) for one
+        RA_Number/FMEA_Number pair. `ra_only` builds a clean RA_Number-
+        only target/question (used for EDO_RA_C, which has no
+        FMEA_Number field at all - a target that still mentions a blank
+        "FMEA_Number : " line confuses the match). Returns the cleaned,
+        validated verification text, or "" if the call failed or came
+        back with no usable answer.
+        """
+        # if ra_only:
+        #     target_text = f"RA_Number : {ra_number}"
+        #     verification_question = (
+        #         f"For RA_Number {ra_number} only, extract the "
+        #         "Verification Reference as a single JSON object - this "
+        #         "record has no FMEA_Number, so match by RA_Number "
+        #         "alone, no other RA pairs."
+        #     )
+        # else:
+        #     target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+        #     verification_question = (
+        #         f"For RA_Number {ra_number} and FMEA_Number {fmea_number} "
+        #         "only, extract the Verification Reference as a single "
+        #         "JSON object - no other RA/FMEA pairs."
+        #     )
+
+        prompt_row = {
+            "prompt_role": prompt_data["prompt_role"],
+            "prompt_text": prompt_data["prompt_text"],
+            "question": "Fetch verification records for {fmea_number} and {ra_number}",
+            "fulltext": "No",
+            "where_filter": "",
+           #"where_document": {"$contains": fmea_number},
+           "where_document":"",
+            "checkpoint": ""
+        }
+
+        try:
+            _, _, response = execute_llm_retry(
+                pipeline_config,
+                edo_document[source_key]["collection"],
+                prompt_row
+            )
+            parsed = parse_json(response)
+        except Exception as e:
+            logging.error(
+                f"CALL 6: verification LLM call against {source_key} failed for "
+                f"RA={ra_number!r} FMEA={fmea_number!r}: {e}"
+            )
+            return ""
+
+        records = deep_extract_records(parsed)
+        row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+
+        verification = normalize_text(
+            get_llm_value(row, "Verification_Reference", "Verification Reference")
+        )
+        verification = clean_verification_reference_text(verification)
+
+        # NOTE: the self-referential-RA&C-echo check (see
+        # is_self_referential_ra_document_text() above) used to also be
+        # applied here and discard an EDO_RA_C answer that was just the
+        # RA&C document naming itself back (e.g. "NPD36702 Vest APX Risk
+        # Assessment and Control RA-124"). Per requirement, EDO_RA_C's
+        # answer should now be printed to Column E even when it's only
+        # that Location/File identification and nothing more specific -
+        # a real answer from the RA&C document is preferred over leaving
+        # Column E blank, so that check is no longer applied here.
+        is_bad_answer = (
+            not verification
+            or verification.lower() == "none"
+            or is_non_answer_verification_text(verification)
+        )
+        return "" if is_bad_answer else verification
+
+    for key, edo in final_edos.items():
+        ra_number = edo.get("RA_Number", "")
+        fmea_number = edo.get("FMEA_Number", "")
+
+        if ra_number in (None, "", "Blank") and fmea_number in (None, "", "Blank"):
+            logging.info(
+                f"CALL 6: skipping {edo.get('edo_tag', key)!r} - no "
+                "RA_Number or FMEA_Number available to search with, so "
+                "Column E is left blank for this record."
+            )
+            continue
+
+        verification = ""
+
+        # ---- 1st attempt: EDO_FMEA, whenever this record has an
+        # FMEA_Number and the document is configured. ----
+        if fmea_number not in (None, "", "Blank") and "edo_fmea" in edo_document:
+            verification = _query_verification_reference(
+                "edo_fmea", ra_number, fmea_number, ra_only=False
+            )
+
+        # ---- OR fallback: EDO_RA_C via RA_Number alone, tried whenever
+        # EDO_FMEA didn't produce a usable answer - whether because
+        # FMEA_Number was blank to begin with, EDO_FMEA isn't
+        # configured, or EDO_FMEA simply had no entry for this
+        # RA/FMEA pair. ----
+        if not verification and ra_number not in (None, "", "Blank") and "edo_ra_c" in edo_document:
+            logging.info(
+                f"CALL 6: no usable answer from EDO_FMEA for RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - trying EDO_RA_C via RA_Number instead."
+            )
+            verification = _query_verification_reference(
+                "edo_ra_c", ra_number, fmea_number, ra_only=True
+            )
+
+        if verification:
+            edo["verification_reference"] = verification
+            logging.info(
+                f"CALL 6: verification reference for RA={ra_number!r} "
+                f"FMEA={fmea_number!r} -> {verification!r}"
+            )
+        else:
+            logging.info(
+                f"CALL 6: no usable verification reference found for "
+                f"RA={ra_number!r} FMEA={fmea_number!r} in either "
+                "EDO_FMEA or EDO_RA_C - Column E left blank."
+            )
+
+    return final_edos
+
+
+def format_traceability_references(traceability_entries):
+    """
+    Formats a list of {"Trace_Code": ..., "Reference": ...} dicts - the
+    expected shape of the "EDO_NEW_Traceability_Reference" prompt's
+    "Traceability_References" array - into one line per code, e.g.:
+        (DRS-524) NPD43974 Rev 1 - Vest APX System Regulatory Verification TD
+        RRAA - NPD35987
+        (MS CU Mod-448) NPD45862 Rev 3 - TDR for Titan CB and EMC Report
+    A code containing a digit (DRS-524, MS CU Mod-448, ...) is wrapped
+    in parentheses; a purely alphabetic code (RRAA) is shown as-is,
+    separated from its reference by " - ". Entries missing either a
+    code or a reference (or whose reference is "None"/"Blank") are
+    skipped rather than printed half-empty.
+    """
+    lines = []
+    for item in traceability_entries or []:
+        if not isinstance(item, dict):
+            continue
+
+        code = normalize_text(item.get("Trace_Code") or item.get("trace_code"))
+        reference = normalize_text(item.get("Reference") or item.get("reference"))
+
+        if not code or not reference or reference.lower() in ("none", "blank"):
+            continue
+
+        if re.search(r'\d', code):
+            lines.append(f"({code}) {reference}")
+        else:
+            lines.append(f"{code} - {reference}")
+
+    return "\n".join(lines)
+
+
+def extract_and_apply_traceability_reference(
+    client,
+    product_family,
+    product,
+    templatename,
+    pipeline_config,
+    edo_document,
+    final_edos,
+    db: DatabaseHandler
+):
+    """
+    CALL 6B - companion to extract_and_apply_verification_details()
+    (CALL 6), run immediately after it over the same merged
+    `final_edos` dict (Existing + New together).
+
+    Per requirement, the traceability call now works exactly like the
+    verification reference call: ONE LLM call per record (same loop-
+    per-entry pattern), using the "EDO_NEW_Traceability_Reference"
+    prompt. That prompt is required to resolve EVERY individual trace/
+    reference code on the record (DRS-###, MS CU Mod-###, RRAA, etc.)
+    to its OWN specific document reference - never a single combined
+    "Source: ... | Location: ... | Result: ..." blob covering every
+    code at once, which is what was going wrong before.
+
+    The formatted, per-code text (see format_traceability_references())
+    is then MERGED into each record's "verification_reference" field -
+    appended after whatever extract_and_apply_verification_details()
+    already put there - so Column E ends up carrying both pieces
+    together, exactly as requested.
+    """
+    logging.info("=" * 80)
+    logging.info("CALL 6B: TRACEABILITY REFERENCE EXTRACTION (POST-MERGE, PER-RECORD, PER-CODE)")
+    logging.info("=" * 80)
+
+    if not final_edos:
+        logging.info("No merged EDO records to extract traceability references for.")
+        return final_edos
+
+    if "edo_fmea" in edo_document:
+        traceability_source_key = "edo_fmea"
+    elif "edo_ra_c" in edo_document:
+        logging.warning(
+            "EDO_FMEA document/collection not found in edo_document - "
+            "falling back to EDO_RA_C (RA&C) as the document identity "
+            "for traceability reference extraction."
+        )
+        traceability_source_key = "edo_ra_c"
+    else:
+        logging.warning(
+            "Neither EDO_FMEA nor EDO_RA_C document/collection is "
+            "configured - skipping traceability reference extraction "
+            "(CALL 6B)."
+        )
+        return final_edos
+
+    try:
+        prompt_data = get_prompt(
+            client,
+            product_family,
+            product,
+            templatename,
+            "EDO_NEW_Traceability_Reference",
+            db
+        )
+    except Exception as e:
+        logging.error(
+            "CALL 6B SKIPPED - could not load the "
+            f"'EDO_NEW_Traceability_Reference' prompt: {e}. Leaving "
+            "verification_reference as whatever CALL 6 already set."
+        )
+        return final_edos
 
     for key, edo in final_edos.items():
         ra_number = edo.get("RA_Number", "")
@@ -2557,26 +3162,26 @@ def extract_and_apply_verification_details(
             "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
             "question": (
                 f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
-                "only, extract the Verification Reference as a single "
-                "JSON object - no other RA/FMEA pairs."
+                "only, resolve every individual trace code to its own "
+                "reference as a single JSON object - no other RA/FMEA "
+                "pairs, and no code merged with another."
             ),
             "fulltext": "Yes",
             "where_filter": "",
-           #"where_document": {"$contains": fmea_number},
-           "where_document":"",
+            "where_document": "",
             "checkpoint": ""
         }
 
         try:
             _, _, response = execute_llm_retry(
                 pipeline_config,
-                edo_document[verification_source_key]["collection"],
+                edo_document[traceability_source_key]["collection"],
                 prompt_row
             )
             parsed = parse_json(response)
         except Exception as e:
             logging.error(
-                f"CALL 6: verification LLM call failed for "
+                f"CALL 6B: traceability LLM call failed for "
                 f"RA={ra_number!r} FMEA={fmea_number!r}: {e}"
             )
             continue
@@ -2584,14 +3189,26 @@ def extract_and_apply_verification_details(
         records = deep_extract_records(parsed)
         row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
 
-        verification = normalize_text(
-            get_llm_value(row, "Verification_Reference", "Verification Reference")
+        traceability_entries = (
+            row.get("Traceability_References")
+            or row.get("traceability_references")
+            or []
         )
-        if verification and verification.lower() != "none":
-            edo["verification_reference"] = verification
+        if not isinstance(traceability_entries, list):
+            traceability_entries = []
+
+        traceability_text = format_traceability_references(traceability_entries)
+
+        if traceability_text:
+            existing_text = normalize_text(edo.get("verification_reference"))
+            if existing_text and existing_text.lower() != "none":
+                edo["verification_reference"] = f"{existing_text}\n{traceability_text}"
+            else:
+                edo["verification_reference"] = traceability_text
+
             logging.info(
-                f"CALL 6: verification reference for RA={ra_number!r} "
-                f"FMEA={fmea_number!r} -> {verification!r}"
+                f"CALL 6B: traceability reference for RA={ra_number!r} "
+                f"FMEA={fmea_number!r} -> {traceability_text!r}"
             )
 
     return final_edos
@@ -2785,9 +3402,9 @@ Low:
 - MVP
 - Cosmetic or administrative changes with no impact to safety or functionality
 
-None:
-- Description does not match any of the above categories.
-
+-don't return none values 
+- if description it self that this mentioned as medium take that risk as Medium.
+and return why it is considering the rsk status as medium and high on each edo 
 Description:
 {text}
 
@@ -2795,7 +3412,6 @@ Return ONLY one word:
 High
 Medium
 Low
-None
 """
 
     risk_status = "None"
@@ -2974,6 +3590,14 @@ cell_alignment = Alignment(
 BLACK = "FF000000"
 RED = "FFFF0000"
 
+# Font used for the Verification Reference column (always) and for
+# every cell of a New EDO record (per requirement). Column L / Risk
+# Classification (col 12) keeps its own risk-based fill+font from
+# apply_risk_cell_style() and is intentionally excluded below, since
+# overriding it to red text would fight with the red/yellow/green fill
+# already used to convey High/Medium/Low risk.
+RED_FONT = Font(color=RED, name="Calibri", size=10)
+
 def _text(value):
     return "" if value is None else str(value)
 
@@ -3058,6 +3682,124 @@ def format_edo_tag_text(value):
     return _normalize_document_codes(text)
 
 
+# ---- Row auto-height (fits every row's height to its actual content) ----
+# openpyxl never recomputes row heights for wrapped text on its own (that
+# normally only happens inside Excel itself, on open/edit), so without
+# this every row stays at whatever height the template started with and
+# long multi-line cell text gets visually clipped. autosize_edo_rows()
+# below estimates, for every row in the written range, how many wrapped
+# lines each of its cells actually needs (given that column's width and
+# wrap_text=True), and grows the row height to fit the tallest cell -
+# merged multi-row blocks (Columns A-E, L, M) have their required
+# height correctly spread across every physical row they span, instead
+# of being judged only against the top row of the merge.
+
+DEFAULT_COLUMN_WIDTH_CHARS = 8.43
+ROW_LINE_HEIGHT_PT = 15
+ROW_MIN_HEIGHT_PT = 15
+
+
+def _cell_text_for_sizing(value):
+    """
+    Returns the plain text openpyxl will actually render for `value`,
+    whether it's a plain string or a CellRichText (used for Column D's
+    base-text + red trace-text rich cells) - CellRichText is a sequence
+    of str/TextBlock items, so its rendered text is the concatenation of
+    each item's text (TextBlock.text for TextBlock items, the item
+    itself for plain str items).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, CellRichText):
+        parts = []
+        for item in value:
+            parts.append(item.text if isinstance(item, TextBlock) else str(item))
+        return "".join(parts)
+    return str(value)
+
+
+def _column_width_chars(sheet, col_idx):
+    letter = get_column_letter(col_idx)
+    width = sheet.column_dimensions[letter].width
+    return width if width else DEFAULT_COLUMN_WIDTH_CHARS
+
+
+def _lines_needed_for_text(text, col_width_chars):
+    """
+    Estimates how many wrapped display lines `text` will occupy in a
+    wrap_text=True cell of the given column width - splits on explicit
+    newlines first (each forces its own line break), then estimates how
+    many times each of those segments itself wraps, based on roughly how
+    many characters fit across the column's width.
+    """
+    if not text:
+        return 1
+
+    chars_per_line = max(1, int(round(col_width_chars)))
+    total_lines = 0
+    for segment in str(text).split("\n"):
+        if not segment:
+            total_lines += 1
+        else:
+            total_lines += math.ceil(len(segment) / chars_per_line)
+    return max(1, total_lines)
+
+
+def _merge_span_for_cell(sheet, row, col):
+    """
+    Returns (first_row, last_row) of the merged range containing
+    (row, col), or (row, row) if that cell isn't part of any merge.
+    """
+    for merged_range in sheet.merged_cells.ranges:
+        if (
+            merged_range.min_row <= row <= merged_range.max_row
+            and merged_range.min_col <= col <= merged_range.max_col
+        ):
+            return merged_range.min_row, merged_range.max_row
+    return row, row
+
+
+def autosize_edo_rows(sheet, start_row, end_row, columns=range(1, 14)):
+    """
+    Grows (never shrinks) every row's height in [start_row, end_row] to
+    fit the actual wrapped content of every column in `columns` -
+    covering the whole table (A-M) so every row auto-extends according
+    to its data, not just the ones carrying images.
+    """
+    if end_row < start_row:
+        return
+
+    row_line_needs = {row: 1 for row in range(start_row, end_row + 1)}
+    processed_spans = set()
+
+    for row in range(start_row, end_row + 1):
+        for col in columns:
+            span_start, span_end = _merge_span_for_cell(sheet, row, col)
+            span_key = (span_start, span_end, col)
+            if span_key in processed_spans:
+                continue
+            processed_spans.add(span_key)
+
+            text = _cell_text_for_sizing(sheet.cell(span_start, col).value)
+            if not text:
+                continue
+
+            col_width = _column_width_chars(sheet, col)
+            lines = _lines_needed_for_text(text, col_width)
+            span_rows = span_end - span_start + 1
+            lines_per_row = math.ceil(lines / span_rows)
+
+            for r in range(max(span_start, start_row), min(span_end, end_row) + 1):
+                if lines_per_row > row_line_needs[r]:
+                    row_line_needs[r] = lines_per_row
+
+    for row, lines in row_line_needs.items():
+        needed_height = max(ROW_MIN_HEIGHT_PT, lines * ROW_LINE_HEIGHT_PT)
+        current_height = sheet.row_dimensions[row].height or 0
+        if needed_height > current_height:
+            sheet.row_dimensions[row].height = needed_height
+
+
 def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=None, new_edo_diagram_queue=None):
     """
     Final writer:
@@ -3072,14 +3814,13 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
           image is placed on that split row - Column H is simply left
           empty (no image is duplicated).
 
-          For New EDO records specifically, `ra_fmea_images` (built by
-          extract_new_edo_diagrams(), keyed by
-          (RA_Number.upper(), FMEA_Number.upper())) is checked FIRST -
-          if that record's own RA/FMEA pair (Column D) has a matched
-          diagram, that exact image is placed instead of the generic
-          FIFO queue. Only when there's no per-record match does the
-          generic queue apply. Every case where Column H ends up with
-          no image at all is logged with the specific reason.
+          For New EDO records specifically, the row whose RA_Number /
+          FMEA_Number match TARGET_IMAGE_RA_NUMBER / TARGET_IMAGE_FMEA_NUMBER
+          (currently RA-141 / FMEA SYS-152) is guaranteed the next queued
+          diagram, reserved for it before any other row can consume it.
+          Every other New EDO row falls back to the same shared FIFO
+          queue as before. Every case where Column H ends up with no
+          image at all is logged with the specific reason.
     K   : Risk Classification
     L   : Risk evaluation text / classification trigger
     M   : Gap and Verification Status statement
@@ -3090,6 +3831,26 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
     image_queue = list(images) if images else []
     new_edo_diagram_queue = list(new_edo_diagram_queue) if new_edo_diagram_queue else []
     last_image_row = start_row
+
+    # ---- Reserve a diagram specifically for RA-141 / FMEA SYS-152 ----
+    # Guarantees that record gets an image even if other New EDO rows
+    # come first in iteration order and would otherwise drain the FIFO
+    # queue before reaching it.
+    reserved_target_image = None
+    if new_edo_diagram_queue:
+        for candidate_edo in final_edos.values():
+            if (
+                candidate_edo.get("edo_type") == "New"
+                and normalize_id(candidate_edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
+                and normalize_id(candidate_edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+            ):
+                reserved_target_image = new_edo_diagram_queue.pop(0)
+                logging.info(
+                    "COLUMN H: reserved the next queued New EDO diagram "
+                    f"exclusively for RA={TARGET_IMAGE_RA_NUMBER!r} "
+                    f"FMEA={TARGET_IMAGE_FMEA_NUMBER!r}."
+                )
+                break
 
     for key, edo in final_edos.items():
 
@@ -3147,8 +3908,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             if is_new:
                 is_target_row = (
-                    normalize_id(edo.get("RA_Number")) == "RA-66"
-                    and normalize_id(edo.get("FMEA_Number")) == "FMEA SYS-74"
+                    normalize_id(edo.get("RA_Number")) == "RA-141"
+                    and normalize_id(edo.get("FMEA_Number")) == "FMEA SYS-152"
                 )
 
                 if is_target_row:
@@ -3166,19 +3927,24 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                     if not normalize_text(col_i_value):
                         col_i_value = "None"
 
+
             # Column D: for Existing EDOs only, append the trace text
             # (existing_trace, from extract_existing_edo_trace_details /
             # apply_existing_edo_trace) below the RA/FMEA data already in
             # dfmea, in the same cell/row. New EDOs are left untouched.
+            # Per requirement: no "Trace:" label - just the trace value
+            # itself, on its own line, and kept separate here (rather
+            # than baked into col_d_value as plain text) so it can be
+            # colored red independently - see the rich-text cell
+            # assignment further below.
             col_d_value = format_output_text(edo.get("dfmea"))
+            existing_trace_value = ""
             if not is_new:
-                trace_text = format_output_text(edo.get("existing_trace"))
-                if trace_text:
-                    col_d_value = f"{col_d_value}\n Trace:{trace_text}" if col_d_value else trace_text
+                existing_trace_value = format_output_text(edo.get("existing_trace"))
 
             logging.info(f"{key} dfmea raw: {edo.get('dfmea')}")
             logging.info(f"{key} existing_trace raw: {edo.get('existing_trace')}")
-            logging.info(f"{key} final column D value: {col_d_value}")
+            logging.info(f"{key} final column D base value: {col_d_value}")
 
             values = {
                 1: tag_value,
@@ -3212,7 +3978,33 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                 cell.value = value
                 _apply_border_alignment(cell)
 
+                # Per requirement: Verification Reference (col 5) is
+                # always red, and every cell of a New EDO record is red -
+                # except col 12 (Risk Classification), which keeps its
+                # own risk-based fill/font applied right below.
+                if col == 5 or (is_new and col != 12):
+                    cell.font = RED_FONT
+
             apply_risk_cell_style(sheet.cell(current_row, 12), risk)
+
+            # Column D rich text: when this is an Existing EDO with a
+            # trace value, re-render the cell as base text (normal
+            # color) + trace text (red), instead of one flat-colored
+            # string - the border/alignment set above are unaffected by
+            # re-assigning the cell's value.
+            if not is_new and existing_trace_value:
+                d_cell = sheet.cell(current_row, 4)
+                base_font = InlineFont(color=BLACK, rFont="Calibri", sz=10)
+                trace_font = InlineFont(color=RED, rFont="Calibri", sz=10)
+                if col_d_value:
+                    d_cell.value = CellRichText(
+                        TextBlock(base_font, col_d_value),
+                        TextBlock(trace_font, "\n" + existing_trace_value),
+                    )
+                else:
+                    d_cell.value = CellRichText(
+                        TextBlock(trace_font, existing_trace_value)
+                    )
 
             # PLACE AN IMAGE ON THIS SPLIT ROW, WITHIN THIS EDO TAG'S
             # MERGED BLOCK (Column H/8 is never merged across split rows,
@@ -3229,13 +4021,26 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             # Column D carries RA_Number/FMEA_Number for this row. Only
             # place a New EDO diagram on rows where that identifier is
-            # actually present (i.e. real New EDO rows) - pure FIFO
-            # order, no content matching of any kind.
+            # actually present (i.e. real New EDO rows).
             has_ra_fmea_in_col_d = bool(
                 normalize_text(edo.get("RA_Number")) or normalize_text(edo.get("FMEA_Number"))
             )
 
-            if is_new and has_ra_fmea_in_col_d and new_edo_diagram_queue:
+            is_target_image_row = (
+                is_new
+                and normalize_id(edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
+                and normalize_id(edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+            )
+
+            if is_target_image_row and reserved_target_image:
+                row_image = reserved_target_image
+                reserved_target_image = None
+                logging.info(
+                    f"COLUMN H (row {current_row}, key {key!r}): placed the "
+                    f"RESERVED New EDO diagram for RA={TARGET_IMAGE_RA_NUMBER!r} "
+                    f"FMEA={TARGET_IMAGE_FMEA_NUMBER!r}."
+                )
+            elif is_new and has_ra_fmea_in_col_d and new_edo_diagram_queue:
                 row_image = new_edo_diagram_queue.pop(0)
                 logging.info(
                     f"COLUMN H (row {current_row}, key {key!r}): placed next "
@@ -3298,6 +4103,13 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                     end_column=col
                 )
                 sheet.cell(first, col).alignment = cell_alignment
+
+    # ---- Auto-extend every row's height to fit its actual data ----
+    # Runs last, after every value AND every merge is already in place,
+    # so merged multi-row blocks (Columns A-E, L, M) are measured against
+    # the full range they span rather than just their first physical row.
+    autosize_edo_rows(sheet, start_row, current_row - 1)
+
     print(f"current _value:")
     return current_row
 
@@ -3441,13 +4253,15 @@ def generate_edo_template(
                     existing_edos,
                     existing_trace_details
                 )
-
+            
             except Exception as trace_error:
                 logging.warning(
                     "CALL 3 SKIPPED - trace extraction failed, leaving "
                     "the trace part of column D blank for this run. "
                     f"Reason: {trace_error}"
                 )
+
+            print(f"extractedt existing edo trace: ", existing_edos)
 
         # ---------------------------------------------------
         # CALL 4: Extract New EDO tags
@@ -3462,6 +4276,23 @@ def generate_edo_template(
             db
         )
         print(f"extract_new_edo_tags: ", edo_new_data)
+
+        # ---------------------------------------------------
+        # CALL 4.5: Filter New EDO tags by Risk Evaluation - only rows
+        # whose Risk Evaluation (from EDO_FMEA) is "Medium" survive into
+        # edo_new_data; everything else is dropped before CALL 5 runs.
+        # ---------------------------------------------------
+        edo_new_data = filter_new_edo_by_risk_evaluation(
+            client,
+            product_family,
+            product,
+            templatename,
+            pipeline_config,
+            edo_document,
+            edo_new_data,
+            db
+        )
+        print(f"filter_new_edo_by_risk_evaluation: ", edo_new_data)
 
         # ---------------------------------------------------
         # CALL 5: Extract New EDO summary details (EXCEPT verification
@@ -3540,6 +4371,33 @@ def generate_edo_template(
                 "CALL 6 SKIPPED - verification reference extraction "
                 "failed, leaving column E as 'Blank' for this run. "
                 f"Reason: {verification_error}"
+            )
+
+        # ---------------------------------------------------
+        # CALL 6B: Traceability Reference extraction - runs right after
+        # CALL 6, over the same merged final_edos, one LLM call per
+        # record. Resolves each individual trace code (DRS-###, MS CU
+        # Mod-###, RRAA, ...) to its own specific document reference and
+        # merges the formatted result into verification_reference, so
+        # Column E carries both verification and traceability content
+        # together.
+        # ---------------------------------------------------
+        try:
+            final_edos = extract_and_apply_traceability_reference(
+                client,
+                product_family,
+                product,
+                templatename,
+                pipeline_config,
+                edo_document,
+                final_edos,
+                db
+            )
+        except Exception as traceability_reference_error:
+            logging.warning(
+                "CALL 6B SKIPPED - traceability reference extraction "
+                "failed, leaving column E as whatever CALL 6 already set "
+                f"for this run. Reason: {traceability_reference_error}"
             )
 
         # ---------------------------------------------------
