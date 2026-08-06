@@ -55,7 +55,7 @@ IMAGE_TEXT_OFFSET_PX = 45
 # the next available diagram from that queue, reserved for it ahead of
 # every other New EDO row - see format_edo_worksheet().
 TARGET_IMAGE_RA_NUMBER = "RA-141"
-TARGET_IMAGE_FMEA_NUMBER = "FMEA SYS-152"
+TARGET_IMAGE_FMEA_NUMBER = "FMEA Sys-152"
 
 
 # ==========================================================
@@ -916,23 +916,78 @@ def blank(value):
     to the output Excel - a missing value should simply be an empty
     cell. This now just normalizes the text and returns "" for anything
     empty, instead of inserting "Blank".
+
+    BUGFIX: normalize_text() alone does NOT catch the case where the
+    LLM itself literally answers with the placeholder word "Blank" (or
+    "None") as the VALUE of a design_elements field (location/
+    description/reason/sysdd) - that text passed straight through
+    unchanged. Two problems resulted:
+      1. The literal word "Blank"/"None" got printed into the Excel
+         cell instead of a real value or an empty cell.
+      2. In format_edo_worksheet(), the split-row forward-fill logic
+         (`if description: last_description = description else:
+         description = last_description`) only treats a field as
+         "missing" when it's falsy/empty - a non-empty string like
+         "Blank" is truthy, so forward-fill never kicked in for that
+         split row, and the next split row(s) of the same EDO tag kept
+         showing the literal "Blank" text instead of inheriting the
+         previous real description/reason (exactly the symptom seen in
+         Excel: split row 1 shows real text, split row 2+ shows
+         "Blank").
+    Treating "none"/"blank" (case-insensitive) as empty here - the
+    same convention already used by get_llm_value() elsewhere in this
+    file - fixes both: the placeholder is never written to Excel, and
+    forward-fill correctly carries the last real value down to every
+    split row that has no genuine value of its own.
     """
-    return normalize_text(value)
+    text = normalize_text(value)
+    if text.lower() in ("none", "blank"):
+        return ""
+    return text
 
 
 def call_llm(prompt, pipeline_config):
     try:
         llm = pipeline_config["llm"]
-        return llm.generate(
+        response = llm.generate(
             prompt,
             context="",
             question="risk classification",
             temperature=pipeline_config["temperature"],
             max_tokens=pipeline_config["max_tokens"]
         )
+        logging.info(f"LLM raw response: {response!r}")
+        return response
     except Exception as e:
-        logging.error(f"LLM risk classification call failed: {e}")
-        return "No"
+        # NOTE: previously returned the literal string "No" here. That
+        # sentinel was indistinguishable from a genuine (wrong) LLM
+        # answer, so callers such as generate_remarks_and_recommendation()
+        # would treat a *failed* call as a valid "No"/short response and
+        # write it straight into Column M. Returning "" instead lets
+        # every caller's existing emptiness checks correctly detect the
+        # failure and fall back cleanly.
+        logging.error(f"LLM call failed: {e}")
+        return ""
+
+
+def is_meaningful_llm_text(response):
+    """
+    True only when `response` is real generated content - i.e. not
+    empty, and not one of the placeholder/failure words an LLM (or a
+    failed call_llm()) might return instead of an actual answer.
+    """
+    if not response:
+        return False
+
+    text = normalize_text(response).strip().upper()
+
+    if not text:
+        return False
+
+    if text in ("NONE", "NO", "N/A", "NA", "NULL", "-"):
+        return False
+
+    return True
 
 
 def clean_response(response):
@@ -961,7 +1016,8 @@ def execute_llm(
         prompt_row["fulltext"],
         prompt_row["where_filter"],
         prompt_row["where_document"],
-        prompt_row.get("checkpoint", "")
+        prompt_row.get("checkpoint", ""),
+        max_results=prompt_row.get("max_results"),
     )
 
 
@@ -1512,8 +1568,8 @@ def extract_existing_edo_trace_details(
             "question": f"Fetch all trace records for {edo_tag} (FMEA_Number: {fmea_number})",
             "fulltext": "Yes",
             "where_filter": "",
-            "where_document": '{"$contains": "Safety Hazard DFMEA Table" }',
-            "checkpoint": ""
+            "where_document": "",
+            "checkpoint": f"Fetch all trace records for {edo_tag} (FMEA_Number: {fmea_number})"
         }
 
         try:
@@ -1545,20 +1601,68 @@ def extract_existing_edo_trace_details(
     return results
 
 
+def parse_custom_fmea_format(response):
+    """
+    Parses custom text format containing:
+    Fmea_number: SYS-147  
+    [Document_number: NPD37819  
+    {Trace: MRS CU FMEA-391, Trace: MRS CU FMEA-463}]
+
+    Returns a list of formatted trace strings, e.g.:
+    [
+      "NPD37819: MRS CU FMEA-391, MRS CU FMEA-463",
+      "NPD36569: MRS Software FMEA-422, MRS Software FMEA-423"
+    ]
+    """
+    text = normalize_text(response)
+    traces = []
+
+    # Find each block starting with [Document_number: ... {Trace: ...}]
+    # NOTE: doc_num uses a non-greedy `.*?` (bounded by the next "{")
+    # instead of a `[^\]\n]+` char class, so it can't accidentally
+    # swallow past a brace on multi-line blocks.
+    doc_blocks = re.findall(
+        r"\[\s*Document_number\s*:\s*(.*?)\s*\{(.*?)\}\s*\]?",
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+
+    for doc_num, trace_content in doc_blocks:
+        doc_num = doc_num.strip()
+
+        # Extract all individual tag values following "Trace:".
+        # FIXED: the previous pattern used a character class
+        # [^,Trace:\}] which - combined with re.IGNORECASE - excludes
+        # any occurrence of the individual letters T/r/a/c/e (any
+        # case), NOT the literal substring "Trace:". That truncated
+        # every value at its first such letter, e.g. "MRS CU FMEA-391"
+        # got cut to just "M" (stopped at the "R"). Instead, capture
+        # everything up to the NEXT "Trace:" marker or the end of the
+        # block, which correctly preserves the full value.
+        raw_tags = re.findall(
+            r"Trace\s*:\s*(.*?)(?=,\s*Trace\s*:|$)",
+            trace_content,
+            re.IGNORECASE | re.DOTALL
+        )
+        tags = [t.strip().rstrip(",").strip() for t in raw_tags if t.strip()]
+
+        if tags:
+            # Format as: NPD37819: MRS CU FMEA-391, MRS CU FMEA-463
+            comma_separated_tags = ", ".join(tags)
+            traces.append(f"{doc_num}: {comma_separated_tags}")
+
+    return traces
+
 def _parse_single_edo_trace_response(edo_tag, response):
     """
     Parses ONE EDO's raw LLM response into {"traces": [str, ...]}.
-    Tries, in order:
-      1. Direct JSON parse (parse_json / clean_llm_response), expecting
-         either {"traces": [...]} or {"<edo_tag>": {"traces": [...]}}.
-      2. Fenced ```json code blocks (extract_json_code_blocks).
-      3. Markdown fallback (parse_markdown_trace_response) - repurposed
-         here to just pull bullet lines out, since we now only care
-         about the plain "<Document#>: <Tag#>" strings.
-    Always returns a dict with a "traces" list (possibly empty), never
-    raises - a parse failure just means empty traces for that one EDO,
-    not a loss of the whole run.
+    Order of operations:
+      1. Direct JSON parse (parse_json / clean_llm_response)
+      2. Fenced ```json code blocks (extract_json_code_blocks)
+      3. Custom Bracket/Trace parser (parse_custom_fmea_format) -> Handles your prompt format!
+      4. Legacy Markdown fallback (parse_markdown_trace_response)
     """
+    # 1. Direct JSON parse
     parsed = parse_json(response)
 
     def normalize_result(obj):
@@ -1568,7 +1672,6 @@ def _parse_single_edo_trace_response(edo_tag, response):
                 return {"traces": traces}
             if edo_tag in obj and isinstance(obj[edo_tag], dict):
                 return normalize_result(obj[edo_tag])
-            # single-key dict wrapping the real payload, e.g. {"EDO-29": {...}}
             for v in obj.values():
                 if isinstance(v, dict) and "traces" in v:
                     return normalize_result(v)
@@ -1578,6 +1681,7 @@ def _parse_single_edo_trace_response(edo_tag, response):
     if result is not None:
         return result
 
+    # 2. Code block parser
     code_block_records = extract_json_code_blocks(response)
     for block in code_block_records:
         result = normalize_result(block)
@@ -1588,6 +1692,16 @@ def _parse_single_edo_trace_response(edo_tag, response):
             )
             return result
 
+    # 3. Custom Bracket/Trace parser for the custom prompt format
+    custom_traces = parse_custom_fmea_format(response)
+    if custom_traces:
+        logging.info(
+            f"_parse_single_edo_trace_response: {edo_tag} successfully extracted "
+            f"{len(custom_traces)} document trace group(s) using Custom Bracket parser."
+        )
+        return {"traces": custom_traces}
+
+    # 4. Markdown fallback parser
     markdown_records = parse_markdown_trace_response(response)
     if markdown_records:
         traces = []
@@ -1835,20 +1949,14 @@ def extract_new_edo_tags(
         "prompt_role": prompt_data["prompt_role"],
         "prompt_text": prompt_data["prompt_text"],
         "question": (
-            'Extract risk assessment and control Table from the document'
+            'Get all RA-# entries whose Risk Evaluation status is "See FMEA" '
+            'from Appendix A - Risk Assessment and Control Table.'
         ),
         "fulltext": "Yes",
         "where_filter": "",
-        # NOTE: the "$contains" filter here was returning 0 retrieved
-        # docs (confirmed via RETRIEVED DOCS COUNT logging) - it wasn't
-        # matching the actual chunk text, so it silently starved the LLM
-        # of any context. Matching the pattern used by every other
-        # working fulltext="Yes" call in this file (EDO_EXISTING,
-        # verification-reference, etc.), where_document is left empty so
-        # fulltext mode can pull the full document instead of being
-        # filtered down to nothing.
-        "where_document": "",
-        "checkpoint": ('Extract risk assessment and control Table from the document')
+        "where_document": '{"$contains": "See FMEA"}',
+        "checkpoint": ('Extract all Appendix A rows whose Risk Evaluation is "See FMEA".'),
+        "max_results": 25,
     }
 
     # ---- DIAGNOSTIC: log how many chunks/docs are in this collection,
@@ -1886,24 +1994,53 @@ def extract_new_edo_tags(
             continue
 
         ra_number = normalize_text(row.get("RA_Number") or row.get("RA Number") or "")
-        fmea_number = normalize_text(row.get("FMEA_Number") or row.get("FMEA Number") or "")
         status = normalize_text(row.get("Status") or row.get("status") or "")
 
-        key = ra_number or fmea_number or f"NEW-EDO-TAG-{index}"
-        if key in edo_new_data:
-            key = f"{key}_{index}"
+        # FIXED: the LLM returns every FMEA number for a given RA as ONE
+        # combined, comma-separated string under "FMEA_Numbers" (plural)
+        # - e.g. "FMEA Sys-150, FMEA Sys-151, FMEA Sys-167, FMEA Sys-725"
+        # - not a single "FMEA_Number". The old code only ever looked
+        # for "FMEA_Number"/"FMEA Number" (singular), so that key never
+        # matched at all and every record ended up with FMEA_Number =
+        # "" downstream - and even if it HAD matched, storing the whole
+        # comma-joined string under one dict entry per RA_Number would
+        # still collapse every FMEA number for that RA into a single
+        # row. Both the plural and singular keys are read here, the
+        # value is split into its individual FMEA numbers, and each one
+        # becomes its OWN separate edo_new_data entry - one row per
+        # RA/FMEA pair, matching the Excel layout where a RA with
+        # several FMEA numbers (e.g. RA-141 with FMEA Sys-154 and
+        # FMEA Sys-729) prints as separate blocks, not one row with
+        # every FMEA number crammed together.
+        fmea_numbers_raw = normalize_text(
+            row.get("FMEA_Numbers") or row.get("FMEA Numbers")
+            or row.get("FMEA_Number") or row.get("FMEA Number") or ""
+        )
+        fmea_numbers = [f.strip() for f in fmea_numbers_raw.split(",") if f.strip()]
+        if not fmea_numbers:
+            # Keep the RA even when it has no FMEA number at all, so it
+            # isn't silently dropped from edo_new_data.
+            fmea_numbers = [""]
 
-        edo_new_data[key] = {
-            "RA_Number": ra_number,
-            "FMEA_Number": fmea_number,
-            "Status": status
-        }
+        for fmea_number in fmea_numbers:
+            key = (
+                f"{ra_number}::{fmea_number}" if ra_number and fmea_number
+                else (ra_number or fmea_number or f"NEW-EDO-TAG-{index}")
+            )
+            if key in edo_new_data:
+                key = f"{key}_{index}"
+
+            edo_new_data[key] = {
+                "RA_Number": ra_number,
+                "FMEA_Number": fmea_number,
+                "Status": status
+            }
 
     logging.info(
         f"extract_new_edo_tags: consolidated {len(edo_new_data)} RA id(s) "
         f"into edo_new_data."
     )
-
+    print ("NEw edo tags:",edo_new_data)
     return edo_new_data
 
 
@@ -1922,20 +2059,34 @@ def filter_new_edo_by_risk_evaluation(
     extract_new_edo_summary_details / CALL 5).
 
     For every RA_Number/FMEA_Number pair already collected in
-    edo_new_data, looks up that record's "Risk Evaluation" column in
-    the EDO_FMEA document (one LLM call per record, same pattern as
-    extract_new_edo_summary_details below). Only entries whose Risk
-    Evaluation is "Medium" (case-insensitive) are kept in edo_new_data;
-    every entry with any other Risk Evaluation value - or where it
-    could not be determined at all - is removed from edo_new_data
-    before it is enriched or written anywhere.
+    edo_new_data, this checks TWO things against the EDO_FMEA document:
+
+        1. Does that exact RA_Number/FMEA_Number pair exist as a row
+           in EDO_FMEA at all?
+        2. If it exists, is that row's Risk_Evaluation value exactly
+           "Medium" (case-insensitive)?
+
+    An entry is kept ONLY when BOTH are true:
+        - Pair IS found in EDO_FMEA, AND its Risk_Evaluation == "Medium"
+          -> entry is kept in edo_new_data, unchanged.
+        - Pair is NOT found in EDO_FMEA (or the lookup fails), OR the
+          row's Risk_Evaluation is anything other than "Medium"
+          (High, Low, blank, missing, non-answer, etc.) -> entry is
+          removed from edo_new_data.
     """
     logging.info("=" * 80)
-    logging.info("STAGE 4a-2: WORKFLOW 2 - NEW EDO RISK EVALUATION FILTER (Medium only)")
+    logging.info("STAGE 4a-2: WORKFLOW 2 - NEW EDO FMEA PRESENCE + RISK EVALUATION FILTER")
     logging.info("=" * 80)
 
     if not edo_new_data:
-        logging.info("No new EDO tags to filter by risk evaluation.")
+        logging.info("No new EDO tags to filter.")
+        return edo_new_data
+
+    if "edo_fmea" not in edo_document:
+        logging.warning(
+            "FMEA PRESENCE FILTER SKIPPED - EDO_FMEA document/collection "
+            "not configured. Leaving edo_new_data unfiltered for this run."
+        )
         return edo_new_data
 
     try:
@@ -1948,31 +2099,13 @@ def filter_new_edo_by_risk_evaluation(
         )
     except Exception as e:
         logging.error(
-            "RISK EVALUATION FILTER SKIPPED - could not load the "
+            "FMEA PRESENCE FILTER SKIPPED - could not load the "
             f"'EDO_NEW_risk_evaluation' prompt: {e}. Leaving edo_new_data "
             "unfiltered for this run."
         )
         return edo_new_data
 
     keys_to_remove = []
-
-    # Every RA/FMEA pair already present in edo_new_data (normalized), so
-    # the "other Medium row" objects returned by the LLM (see instruction 3
-    # of the updated EDO_NEW_risk_evaluation prompt) never get added twice -
-    # either as a duplicate of an existing entry, or twice across two
-    # different target lookups that both happen to surface the same row.
-    seen_pairs = {
-        (
-            normalize_text(e.get("RA_Number", "")).strip().lower(),
-            normalize_text(e.get("FMEA_Number", "")).strip().lower()
-        )
-        for e in edo_new_data.values()
-    }
-
-    # New entries discovered as "other Medium rows". Collected separately
-    # and merged into edo_new_data only after the main loop finishes, since
-    # we must not mutate edo_new_data while iterating over it.
-    entries_to_add = {}
 
     for key, entry in edo_new_data.items():
         ra_number = entry.get("RA_Number", "")
@@ -1984,11 +2117,10 @@ def filter_new_edo_by_risk_evaluation(
             "prompt_role": prompt_data["prompt_role"],
             "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
             "question": (
-                f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
-                "extract the Risk Evaluation value as the first JSON "
-                "object, plus - per instruction 3 - a JSON object for "
-                "every OTHER row in this FMEA whose Risk Evaluation is "
-                "'Medium'."
+                f"Does a row for RA_Number {ra_number} / FMEA_Number "
+                f"{fmea_number} exist in this FMEA document? Return that "
+                "row as a single JSON object if it exists, including its "
+                "Risk_Evaluation value."
             ),
             "fulltext": "Yes",
             "where_filter": "",
@@ -1997,17 +2129,22 @@ def filter_new_edo_by_risk_evaluation(
         }
 
         logging.info(
-            f"--- DEBUG RISK EVALUATION LOOKUP for RA={ra_number!r} "
+            f"--- FMEA PRESENCE + RISK EVALUATION LOOKUP for RA={ra_number!r} "
             f"FMEA={fmea_number!r} ---"
         )
 
-        risk_evaluation = ""
-        other_medium_rows = []
+        found_in_fmea = False
+        detail_row = {}
         try:
             docs, metadata, response = execute_llm_retry(
                 pipeline_config,
                 edo_document["edo_fmea"]["collection"],
                 prompt_row
+            )
+
+            print(
+                f"FMEA FILTER: RAW LLM RESPONSE RA={ra_number!r} "
+                f"FMEA={fmea_number!r} -> {response!r}"
             )
 
             parsed = parse_json(response)
@@ -2017,116 +2154,80 @@ def filter_new_edo_by_risk_evaluation(
 
             detail_row = records[0] if records else {}
 
-            risk_evaluation = normalize_text(
+            # "Present" means the FMEA document actually returned a row
+            # with real content for this RA/FMEA pair - at least one
+            # non-empty, non-placeholder value anywhere in it - not
+            # just an empty object or a "none"/"blank" non-answer.
+            found_in_fmea = any(
+                normalize_text(v) and normalize_text(v).strip().lower() not in ("none", "blank")
+                for v in _flatten_record_values(detail_row)
+            )
+
+        except Exception as e:
+            logging.error(
+                f"FMEA PRESENCE lookup failed for RA={ra_number!r} "
+                f"FMEA={fmea_number!r}: {e}"
+            )
+            found_in_fmea = False
+            detail_row = {}
+
+        # ---- Risk_Evaluation check: only relevant if the row was
+        # actually found. Uses the same normalized/case-insensitive
+        # key matching as get_llm_value, so "Risk_Evaluation",
+        # "Risk Evaluation", "risk_evaluation", etc. all match. ----
+        risk_evaluation_value = ""
+        is_medium_risk = False
+        if found_in_fmea:
+            risk_evaluation_value = normalize_text(
                 get_llm_value(
                     detail_row,
                     "Risk_Evaluation",
                     "Risk Evaluation",
-                    "risk_evaluation"
+                    "risk_evaluation",
+                    "RiskEvaluation",
+                    "Risk_Rating",
+                    "Risk Rating"
                 )
             )
+            is_medium_risk = risk_evaluation_value.strip().lower() == "medium"
 
-            # Everything after the first record is an "other Medium row"
-            # per instruction 3 of the prompt.
-            other_medium_rows = records[1:] if len(records) > 1 else []
-
-        except Exception as e:
-            logging.error(
-                f"RISK EVALUATION lookup failed for RA={ra_number!r} "
-                f"FMEA={fmea_number!r}: {e}"
+            print(
+                f"FMEA FILTER: Risk_Evaluation value for RA={ra_number!r} "
+                f"FMEA={fmea_number!r} -> {risk_evaluation_value!r} "
+                f"(is_medium={is_medium_risk})"
             )
-            risk_evaluation = ""
-            other_medium_rows = []
 
-        entry["Risk_Evaluation"] = risk_evaluation
-
-        if risk_evaluation.strip().lower() != "medium":
+        if found_in_fmea and is_medium_risk:
             logging.info(
-                f"RISK EVALUATION FILTER: excluding RA={ra_number!r} "
-                f"FMEA={fmea_number!r} - Risk Evaluation is "
-                f"{risk_evaluation!r} (not 'Medium')."
+                f"FMEA PRESENCE FILTER: keeping RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - found in EDO_FMEA with "
+                f"Risk_Evaluation={risk_evaluation_value!r}."
+            )
+        elif found_in_fmea and not is_medium_risk:
+            logging.info(
+                f"FMEA PRESENCE FILTER: excluding RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - found in EDO_FMEA but "
+                f"Risk_Evaluation={risk_evaluation_value!r} is not 'Medium'."
             )
             keys_to_remove.append(key)
         else:
             logging.info(
-                f"RISK EVALUATION FILTER: keeping RA={ra_number!r} "
-                f"FMEA={fmea_number!r} - Risk Evaluation is 'Medium'."
+                f"FMEA PRESENCE FILTER: excluding RA={ra_number!r} "
+                f"FMEA={fmea_number!r} - not found in EDO_FMEA."
             )
-
-        # ---- Fold in any "other Medium row" objects the LLM returned ----
-        for other_row in other_medium_rows:
-            if not isinstance(other_row, dict):
-                continue
-
-            other_ra = normalize_text(
-                get_llm_value(other_row, "RA_Number", "RA Number", "ra_number")
-            )
-            other_fmea = normalize_text(
-                get_llm_value(other_row, "FMEA_Number", "FMEA Number", "fmea_number")
-            )
-            other_risk = normalize_text(
-                get_llm_value(
-                    other_row,
-                    "Risk_Evaluation",
-                    "Risk Evaluation",
-                    "risk_evaluation"
-                )
-            )
-
-            if other_risk.strip().lower() != "medium":
-                # Prompt already asks for Medium-only extras, but guard
-                # against the LLM including a non-Medium row anyway.
-                continue
-
-            if not other_ra and not other_fmea:
-                continue
-
-            dedupe_key = (other_ra.strip().lower(), other_fmea.strip().lower())
-            if dedupe_key in seen_pairs:
-                logging.info(
-                    "RISK EVALUATION FILTER: skipping duplicate other-Medium "
-                    f"row RA={other_ra!r} FMEA={other_fmea!r} - already in "
-                    "edo_new_data."
-                )
-                continue
-
-            seen_pairs.add(dedupe_key)
-            new_key = other_ra or other_fmea or f"NEW-EDO-RISK-MEDIUM-{len(entries_to_add) + len(edo_new_data)}"
-            if new_key in edo_new_data or new_key in entries_to_add:
-                new_key = f"{new_key}_{len(entries_to_add)}"
-
-            entries_to_add[new_key] = {
-                "RA_Number": other_ra,
-                "FMEA_Number": other_fmea,
-                "Status": entry.get("Status", ""),
-                "Risk_Evaluation": "Medium"
-            }
-
-            logging.info(
-                "RISK EVALUATION FILTER: adding other-Medium row "
-                f"RA={other_ra!r} FMEA={other_fmea!r} to edo_new_data "
-                f"(discovered while looking up RA={ra_number!r} "
-                f"FMEA={fmea_number!r})."
-            )
+            keys_to_remove.append(key)
 
     for key in keys_to_remove:
         del edo_new_data[key]
 
-    # Merge the newly discovered "other Medium row" entries into
-    # edo_new_data so they flow through the rest of the New EDO pipeline
-    # (summary details, traceability, verification, merge) exactly like
-    # any other new-EDO record.
-    edo_new_data.update(entries_to_add)
-
     logging.info(
-        f"RISK EVALUATION FILTER complete: {len(edo_new_data)} entr"
+        f"FMEA PRESENCE FILTER complete: {len(edo_new_data)} entr"
         f"{'y' if len(edo_new_data) == 1 else 'ies'} remaining "
-        f"({len(keys_to_remove)} excluded for non-Medium risk evaluation, "
-        f"{len(entries_to_add)} other-Medium row(s) added)."
+        f"({len(keys_to_remove)} excluded - not found in EDO_FMEA or "
+        "Risk_Evaluation was not 'Medium')."
     )
-
+    print("FMEA presence + risk evaluation filtered value:", edo_new_data)
     return edo_new_data
-
 
 def extract_new_edo_summary_details(
     client,
@@ -2686,7 +2787,7 @@ def merge_all_edos(existing_edos, new_edos):
             final_key = f"{key}_{counter}"
 
         final_edos[final_key] = normalized
-
+    print("All nerged values:",final_edos)
     return final_edos
 
 
@@ -2892,6 +2993,14 @@ def extract_and_apply_verification_details(
     Assessment and Control RA-124") is printed to Column E as-is when
     that's all EDO_RA_C has for this record - it is no longer treated as
     a non-answer.
+
+    DEBUG (added): the raw LLM response text for each record is now
+    printed at every stage of parsing (raw -> parsed JSON -> extracted
+    row -> cleaned value) and also stored on the record itself under
+    "verification_raw_llm_response", so it's visible in final_edos even
+    when the final verification_reference ends up empty. This makes it
+    possible to tell apart "LLM genuinely found nothing" from "LLM found
+    something but parsing/key-matching dropped it".
     """
     logging.info("=" * 80)
     logging.info("CALL 6: UNIFIED VERIFICATION REFERENCE EXTRACTION (POST-MERGE, PER-RECORD)")
@@ -2923,35 +3032,35 @@ def extract_and_apply_verification_details(
         RA_Number/FMEA_Number pair. `ra_only` builds a clean RA_Number-
         only target/question (used for EDO_RA_C, which has no
         FMEA_Number field at all - a target that still mentions a blank
-        "FMEA_Number : " line confuses the match). Returns the cleaned,
-        validated verification text, or "" if the call failed or came
-        back with no usable answer.
+        "FMEA_Number : " line confuses the match). Returns a tuple:
+        (cleaned_verification_text_or_empty, raw_llm_response_text).
         """
-        # if ra_only:
-        #     target_text = f"RA_Number : {ra_number}"
-        #     verification_question = (
-        #         f"For RA_Number {ra_number} only, extract the "
-        #         "Verification Reference as a single JSON object - this "
-        #         "record has no FMEA_Number, so match by RA_Number "
-        #         "alone, no other RA pairs."
-        #     )
-        # else:
-        #     target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
-        #     verification_question = (
-        #         f"For RA_Number {ra_number} and FMEA_Number {fmea_number} "
-        #         "only, extract the Verification Reference as a single "
-        #         "JSON object - no other RA/FMEA pairs."
-        #     )
+        # BUGFIX: these were previously plain strings, not f-strings, so
+        # the literal text "{ra_number}"/"{fmea_number}" was sent to the
+        # LLM instead of the actual RA/FMEA values - the search query
+        # never told the model which record to look for. This was the
+        # root cause of the RA&C (EDO_RA_C) fallback - "if FMEA number
+        # not available, use RA number with the RA document" - not
+        # reliably returning the right answer: the RA-only fallback
+        # query for EDO_RA_C carried no real RA number either. `target_text`
+        # was also built but never actually included in the prompt (every
+        # other CALL in this file appends it to prompt_text via
+        # "\nTARGETS:\n" + target_text - this one alone omitted it).
+        if ra_only:
+            target_text = f"RA_Number : {ra_number}"
+            verification_question = f"Fetch verification records for {ra_number}"
+        else:
+            target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+            verification_question = f"Fetch verification records for {fmea_number} and {ra_number}"
 
         prompt_row = {
             "prompt_role": prompt_data["prompt_role"],
-            "prompt_text": prompt_data["prompt_text"],
-            "question": "Fetch verification records for {fmea_number} and {ra_number}",
+            "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
+            "question": verification_question,
             "fulltext": "No",
             "where_filter": "",
-           #"where_document": {"$contains": fmea_number},
-           "where_document":"",
-            "checkpoint": ""
+            "where_document": "",
+            "checkpoint": f"Fetch verification records for {fmea_number} and {ra_number}"
         }
 
         try:
@@ -2960,21 +3069,40 @@ def extract_and_apply_verification_details(
                 edo_document[source_key]["collection"],
                 prompt_row
             )
+            print(
+                f"CALL 6: RAW LLM RESPONSE [{source_key}] "
+                f"RA={ra_number!r} FMEA={fmea_number!r} -> {response!r}"
+            )
             parsed = parse_json(response)
+            print(
+                f"CALL 6: PARSED JSON [{source_key}] "
+                f"RA={ra_number!r} FMEA={fmea_number!r} -> {parsed!r}"
+            )
         except Exception as e:
             logging.error(
                 f"CALL 6: verification LLM call against {source_key} failed for "
                 f"RA={ra_number!r} FMEA={fmea_number!r}: {e}"
             )
-            return ""
+            return "", ""
 
         records = deep_extract_records(parsed)
         row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+        print(f"CALL 6: EXTRACTED ROW [{source_key}] RA={ra_number!r} FMEA={fmea_number!r} -> {row!r}")
 
+        # FIXED (see get_llm_value below): this used to only find the
+        # answer when the LLM's JSON key was spelled EXACTLY
+        # "Verification_Reference" or "Verification Reference". A real
+        # response spelled e.g. "Verification_reference" (lowercase
+        # "r") was silently missed, leaving Column E blank even though
+        # the raw LLM response had a valid answer.
         verification = normalize_text(
-            get_llm_value(row, "Verification_Reference", "Verification Reference")
+            get_llm_value(row, "Verification_Reference", "Verification Reference", "verification_reference")
         )
         verification = clean_verification_reference_text(verification)
+        print(
+            f"CALL 6: CLEANED VERIFICATION VALUE [{source_key}] "
+            f"RA={ra_number!r} FMEA={fmea_number!r} -> {verification!r}"
+        )
 
         # NOTE: the self-referential-RA&C-echo check (see
         # is_self_referential_ra_document_text() above) used to also be
@@ -2990,7 +3118,8 @@ def extract_and_apply_verification_details(
             or verification.lower() == "none"
             or is_non_answer_verification_text(verification)
         )
-        return "" if is_bad_answer else verification
+        result = "" if is_bad_answer else verification
+        return result, response
 
     for key, edo in final_edos.items():
         ra_number = edo.get("RA_Number", "")
@@ -3005,11 +3134,12 @@ def extract_and_apply_verification_details(
             continue
 
         verification = ""
+        raw_response = ""
 
         # ---- 1st attempt: EDO_FMEA, whenever this record has an
         # FMEA_Number and the document is configured. ----
         if fmea_number not in (None, "", "Blank") and "edo_fmea" in edo_document:
-            verification = _query_verification_reference(
+            verification, raw_response = _query_verification_reference(
                 "edo_fmea", ra_number, fmea_number, ra_only=False
             )
 
@@ -3023,9 +3153,19 @@ def extract_and_apply_verification_details(
                 f"CALL 6: no usable answer from EDO_FMEA for RA={ra_number!r} "
                 f"FMEA={fmea_number!r} - trying EDO_RA_C via RA_Number instead."
             )
-            verification = _query_verification_reference(
+            verification, raw_response_rac = _query_verification_reference(
                 "edo_ra_c", ra_number, fmea_number, ra_only=True
             )
+            # Keep whichever attempt actually produced a response, so
+            # the debug field isn't overwritten with an empty string
+            # when the RA_C fallback itself errored out but EDO_FMEA
+            # had returned something (even if unusable).
+            raw_response = raw_response_rac or raw_response
+
+        # Store the raw LLM response text on the record itself so it's
+        # visible in final_edos for debugging, regardless of whether
+        # verification parsing succeeded.
+        edo["verification_raw_llm_response"] = raw_response
 
         if verification:
             edo["verification_reference"] = verification
@@ -3040,8 +3180,50 @@ def extract_and_apply_verification_details(
                 "EDO_FMEA or EDO_RA_C - Column E left blank."
             )
 
+    print("VErification_Reference:", final_edos)
     return final_edos
 
+def _normalize_llm_key(key):
+    """Lowercases a key and strips spaces/underscores/hyphens so keys
+    that only differ by case or separator style - e.g.
+    "Verification_Reference", "Verification Reference", and the LLM's
+    actual "Verification_reference" - all compare equal."""
+    return re.sub(r'[\s_\-]+', '', str(key).lower())
+
+
+def get_llm_value(row, *keys):
+    """
+    Returns the first valid, non-empty value found across `keys`.
+    Treats None, "", and any case-insensitive "none"/"blank" placeholder
+    text (e.g. "None", "NONE", "Blank") as invalid/empty, so literal
+    placeholder strings coming back from the LLM never get written to
+    the output Excel as if they were real data.
+
+    FIXED: lookup used to be an exact `row.get(key)` dict lookup, so a
+    real answer returned under a differently-cased/spaced key than the
+    caller asked for - e.g. the LLM answering with "Verification_reference"
+    (lowercase "r") instead of the expected "Verification_Reference" /
+    "Verification Reference" - was silently missed. The caller then saw
+    an empty value and behaved exactly as if the LLM had found nothing,
+    even though the raw response (visible in logs) had a real answer.
+    Both the row's keys and the requested keys are now normalized
+    (lowercased, spaces/underscores/hyphens stripped) before comparing,
+    so any casing/spacing variant of the same key name matches.
+    """
+    if not isinstance(row, dict):
+        return ""
+
+    normalized_row = {_normalize_llm_key(k): v for k, v in row.items()}
+
+    for key in keys:
+        value = normalized_row.get(_normalize_llm_key(key))
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text == "" or text.lower() in ("none", "blank"):
+            continue
+        return value
+    return ""
 
 def format_traceability_references(traceability_entries):
     """
@@ -3339,103 +3521,32 @@ def get_fixed_sysdd_reference():
     return FIXED_SYSDD_REFERENCE
 
 
-def classify_risk_status(description_text, pipeline_config):
+def classify_risk_status(is_new, pipeline_config=None):
     """
-    Risk classification using LLM based on the provided Risk Classification table.
-    Compares/evaluates the description_text against the risk term guidelines
-    below (same call_llm(prompt, pipeline_config) pattern as
-    evaluate_comparison()) and returns High / Medium / Low / None.
+    Risk Classification (Column L / Column 12) is fixed by EDO type -
+    per requirement:
+
+        Existing EDO  -> "Medium"
+        New EDO       -> "High"
+
+    This is a deterministic, content-blind rule now (no LLM call, no
+    dependency on the description/reason/FMEA text) - every Existing
+    EDO record prints "Medium" and every New EDO record prints "High",
+    with no other possible value ("Low"/"None" are no longer produced
+    here).
+
+    `pipeline_config` is kept as an accepted (optional) parameter only
+    so this stays a drop-in replacement for any other caller of the
+    old signature - it is not used.
     """
 
-    print(f"description text", description_text)
+    risk_status = "High" if is_new else "Medium"
 
-    text = normalize_text(description_text).lower()
-
-    print(f"clasification f risk text", text)
-
-    if not text:
-        print(f"risk status", "None")
-        return "None"
-
-    prompt = f"""
-You are a Risk Classification expert.
-
-Classify the following description into exactly one of these categories:
-- High
-- Medium
-- Low
-- None
-
-Risk Classification Guidelines:
-
-High:
-- Potential impact to patient safety
-- Device performance issues
-- Not meeting SOA requirements
-- Gaps in EDO lists
-- Non-existent EDO
-- Missing required V&V
-- Missing required risk documents
-- Satisfies FA / Meets FA requirements
-- Any issue that can significantly affect safety, regulatory compliance, or product functionality
-
-Medium:
-- Documentation gaps
-- Missing or incomplete documents
-- Tracing errors in RTMs
-- RAS
-- DID
-- Updates to existing V&V
-- Risk document updates
-- Compliance issues
-- Moderate documentation or traceability problems
-
-Low:
-- Template updates
-- Drawing updates or creation
-- Minor document updates
-- Clarifications
-- Typographical corrections
-- Missing component qualifications
-- Missing control plans
-- PCS
-- MVP
-- Cosmetic or administrative changes with no impact to safety or functionality
-
--don't return none values 
-- if description it self that this mentioned as medium take that risk as Medium.
-and return why it is considering the rsk status as medium and high on each edo 
-Description:
-{text}
-
-Return ONLY one word:
-High
-Medium
-Low
-"""
-
-    risk_status = "None"
-
-    try:
-        response = call_llm(prompt, pipeline_config)
-        response = clean_response(response)
-
-        normalized = str(response).strip().lower()
-
-        if normalized.startswith("high"):
-            risk_status = "High"
-        elif normalized.startswith("medium"):
-            risk_status = "Medium"
-        elif normalized.startswith("low"):
-            risk_status = "Low"
-        else:
-            risk_status = "None"
-
-    except Exception as e:
-        logging.error(f"Risk classification LLM failed: {e}")
-        risk_status = "None"
-
-    print(f"risk status", risk_status)
+    print(f"risk status ({'New' if is_new else 'Existing'} EDO):", risk_status)
+    logging.info(
+        f"classify_risk_status: edo_type={'New' if is_new else 'Existing'} "
+        f"-> risk_status={risk_status}"
+    )
 
     return risk_status
 
@@ -3463,10 +3574,9 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
       2. Optional "Observation" block - flagged when the FMEA/RA&C trace text
          (Column D) states a DIFFERENT risk level than the assigned Risk
          Classification (Column L)
-      3. Optional "Recommendation"/"Design" block - feature-specific safety
-         mitigation text (manual warning, drawing/design note, or training),
-         generated from the EDO's feature/reason fields when the hazard
-         warrants it
+      3. Optional "Recommendation"/"Design" block - category-driven, feature-specific
+         safety mitigation text (manual warning, drawing note, training, or combined),
+         generated from EDO feature/reason fields.
     """
 
     # ---- 1. Base boilerplate (Gap + Verification Status) ----
@@ -3499,29 +3609,30 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
     if dfmea_text and risk:
         obs_prompt = f"""
-        You are reviewing an Essential Design Output (EDO) risk record.
+You are reviewing an Essential Design Output (EDO) risk record.
 
-        Risk Classification assigned (Column L): {risk}
-        System FMEA / RA&C trace text (Column D): {dfmea_text}
+Risk Classification assigned (Column L): {risk}
+System FMEA / RA&C trace text (Column D): {dfmea_text}
 
-        Does the FMEA/RA&C trace text explicitly state a DIFFERENT risk
-        evaluation (e.g. 'Low', 'Medium', 'High') than the assigned Risk
-        Classification above?
+Does the FMEA/RA&C trace text explicitly state a DIFFERENT risk evaluation (e.g., 'Low', 'Medium', 'High') than the assigned Risk Classification above?
 
-        If yes, reply with EXACTLY this sentence, filling in the FMEA's
-        stated level and the assigned classification (lowercase):
-        Observation: In Sys-FMEA, the risk evaluation is '<fmea_level>'. recommended to change in the sys-FMEA as <assigned_level_lowercase>.
+If yes, reply with EXACTLY this sentence, filling in the FMEA's stated level and the assigned classification (lowercase):
+Observation: In Sys-FMEA, the risk evaluation is '<fmea_level>'. recommended to change in the sys-FMEA as <assigned_level_lowercase>.
 
-        If no mismatch is found, reply with exactly: NONE
-        """
+If no mismatch is found, reply with exactly: NONE
+"""
 
         try:
             obs_response = call_llm(obs_prompt, pipeline_config)
             obs_response = clean_response(obs_response)
-            if obs_response and obs_response.strip().upper() != "NONE":
+            if is_meaningful_llm_text(obs_response):
                 observation_text = obs_response.strip()
         except Exception as e:
             logging.error(f"Observation generation failed: {e}")
+
+        # Fallback keyword scan if LLM is unavailable or yields non-answer
+        if not observation_text:
+            observation_text = _fallback_observation_text(dfmea_text, risk)
 
     # ---- 3. Recommendation / Design block (feature-specific safety mitigation) ----
     recommendation_text = ""
@@ -3530,35 +3641,50 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
     if feature_text or reason_text:
         rec_prompt = f"""
-        You are drafting a "Recommendation" note for an Essential Design
-        Output (EDO) risk record, matching this house style:
+You are preparing the "Recommendation" section of an Essential Design Output checklist.
 
-        - If the hazard needs a User Manual warning/precaution, write it
-          starting with "Recommendation:" (or "Recommendation to add in the
-          User Manual:") followed by concrete warning text.
-        - If the hazard needs a drawing/design change (e.g. a load rating,
-          dimension note, or EDO symbol placement), write it starting with
-          "Design:" followed by the specific design note.
-        - If training is the appropriate mitigation, write it starting with
-          "Recommendation:" followed by the training instruction.
-        - If NONE of the above genuinely apply (the base Gap/Verification
-          Status boilerplate is already sufficient), reply with exactly:
-          NONE
+Study the Product Feature and Reason Identified below:
+Product Feature/Function: {feature_text}
+Reason Identified as EDO: {reason_text}
 
-        Product Feature/Function: {feature_text}
-        Reason Identified as EDO: {reason_text}
+First, determine which category best applies:
 
-        Only return the recommendation block itself (or NONE) - do not
-        repeat the Gap or Verification Status text.
-        """
+Category A: User Manual recommendation
+- Use if the feature involves: electrical safety, cables, power cord, hoses, connectors, patient interaction, warning labels, handling, cleaning, maintenance, storage, or placement/stability.
+
+Category B: Drawing/Design recommendation
+- Use if the feature involves: dimensions, tolerances, load ratings, drawings, materials, CAD, mechanical strength, or hardware specs.
+
+Category C: Training recommendation
+- Use if users/operators must be specifically instructed before using or connecting the product to mitigate risk of misuse.
+
+Category D: Combined Design and User Manual
+- Use if both drawing/design specifications AND user manual caution/warning statements are required.
+
+Category E: No recommendation
+- Reply with NONE if the base Gap and Verification Status boilerplate is already completely sufficient.
+
+RULES:
+1. Write concrete, domain-specific engineering recommendations matched to the exact component. Do NOT write generic or vague placeholders.
+2. If Category A, format headers as "Recommendation:" or "Recommendation to add in the User Manual:" followed by bulleted/structured warnings or precautions.
+3. If Category B, start with "Design:" or "Recommendation:" specifying drawing notes or load/dimensional limits.
+4. If Category C, start with "Recommendation:" specifying operator training parameters.
+5. Return ONLY the recommendation text block itself (or NONE). Do not repeat Gap or Verification text.
+"""
 
         try:
             rec_response = call_llm(rec_prompt, pipeline_config)
             rec_response = clean_response(rec_response)
-            if rec_response and rec_response.strip().upper() != "NONE":
+            if is_meaningful_llm_text(rec_response):
                 recommendation_text = rec_response.strip()
         except Exception as e:
             logging.error(f"Recommendation generation failed: {e}")
+
+        # Expanded rule-based classification fallback engine
+        if not recommendation_text:
+            recommendation_text = _fallback_recommendation_text(
+                feature_text, reason_text, risk
+            )
 
     # ---- Assemble final Column M text ----
     parts = [base_text]
@@ -3569,6 +3695,133 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
 
     return "\n\n".join(parts)
 
+
+def _fallback_observation_text(dfmea_text, risk):
+    """
+    Rule-based fallback for the Observation block when LLM fails.
+    Scans FMEA text for a stated risk word ('low'/'medium'/'high') that disagrees
+    with assigned Risk Classification.
+    """
+    if not dfmea_text or not risk:
+        return ""
+
+    text_lower = dfmea_text.lower()
+    assigned_lower = risk.strip().lower()
+
+    for level in ("low", "medium", "high"):
+        if level == assigned_lower:
+            continue
+        if re.search(rf"\b{level}\b", text_lower):
+            return (
+                f"Observation: In Sys-FMEA, the risk evaluation is '{level}'. "
+                f"recommended to change in the sys-FMEA as {assigned_lower}."
+            )
+
+    return ""
+
+
+def _fallback_recommendation_text(feature_text, reason_text, risk):
+    """
+    Richer, rule-based classification engine for Recommendations.
+    Matches product components against feature keywords and outputs exact-match
+    domain recommendations matching the house spreadsheet templates.
+    """
+    combined = f"{feature_text} {reason_text}".strip()
+    if not combined:
+        return ""
+
+    combined_lower = combined.lower()
+
+    POWER_CORD = (
+        "power cord", "electrical cord", "mains cable", "power supply cable", "plug"
+    )
+    HANDLE = (
+        "handle", "lifting", "load rating", "load capacity", "carrying handle"
+    )
+    HOSE = (
+        "hose", "tubing", "fluid line", "pneumatic tube", "connector hose"
+    )
+    CONTROL_UNIT = (
+        "control unit", "vibration", "stable surface", "placement", "inclined surface"
+    )
+    CARRY_CASE = (
+        "carrying case", "bag", "storage case", "enclosure case"
+    )
+    TRAINING = (
+        "training", "operator error", "user error", "misuse", "improper use", "incorrect use"
+    )
+    DESIGN = (
+        "drawing", "dimension", "tolerance", "material spec", "part number", "cad", "mechanical"
+    )
+
+    # 1. Power Cord / Electrical Safety
+    if any(k in combined_lower for k in POWER_CORD):
+        return (
+            "Recommendation:\n\n"
+            "Recommended to include the following details in the user manual to mitigate potential power cord damage.\n\n"
+            "WARNING:\n"
+            "Proper Use and Handling of Power Cord\n"
+            "- Use only as instructed.\n"
+            "- Do not bend, twist or pull the power cord.\n"
+            "- Inspect regularly for damage.\n"
+            "- Replace immediately if damaged.\n"
+            "- Damaged cords may expose live electrical parts and cause electric shock."
+        )
+
+    # 2. Handle / Load Ratings (Combined Design + User Manual)
+    if any(k in combined_lower for k in HANDLE):
+        return (
+            "Recommendation:\n\n"
+            "It is recommended to include a drawing note specifying the maximum allowable load for the handle.\n\n"
+            "Additionally, include a caution statement in the user manual indicating that exceeding this load may result in handle failure."
+        )
+
+    # 3. Control Unit Placement & Stability
+    if any(k in combined_lower for k in CONTROL_UNIT):
+        return (
+            "Recommendation to add in the User Manual:\n\n"
+            "The control unit should only be placed on a flat, stable surface during operation.\n"
+            "Do not place the unit on inclined or uneven surfaces.\n"
+            "Keep away from edges to prevent falling."
+        )
+
+    # 4. Carrying Case / Inspection
+    if any(k in combined_lower for k in CARRY_CASE):
+        return (
+            "Recommendation to add in the User Manual:\n\n"
+            "Inspect the carrying case for damage or wear before each transport. "
+            "Ensure all latches and zippers are fully secured prior to lifting."
+        )
+
+    # 5. Hose / Tubing / Connectors
+    if any(k in combined_lower for k in HOSE):
+        return (
+            "Recommendation:\n\n"
+            "Training shall be provided to users prior to handling and connecting the hoses to ensure proper and safe operation, "
+            "and appropriate caution notices shall be documented in the User Manual."
+        )
+
+    # 6. Training Specific
+    if any(k in combined_lower for k in TRAINING):
+        return (
+            "Recommendation:\n\n"
+            "Provide operator/user training addressing the identified condition to reduce the risk of misuse or incorrect operation."
+        )
+
+    # 7. Drawing / Engineering Design Specific
+    if any(k in combined_lower for k in DESIGN):
+        return (
+            "Design:\n\n"
+            f"Update the applicable drawing/design documentation to address the identified condition ({reason_text or feature_text}), "
+            "and add the corresponding EDO symbol/callout so the design output is traceable on the drawing."
+        )
+
+    # 8. General User Manual Fallback
+    return (
+        "Recommendation to add in the User Manual:\n\n"
+        f"Warning/Precaution - {reason_text or feature_text}. Users must be made aware of this condition "
+        "and follow the applicable precautions to avoid impact to product performance or safety."
+    )
 
 # ==========================================================
 # EXCEL FORMATTING
@@ -3816,7 +4069,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
           For New EDO records specifically, the row whose RA_Number /
           FMEA_Number match TARGET_IMAGE_RA_NUMBER / TARGET_IMAGE_FMEA_NUMBER
-          (currently RA-141 / FMEA SYS-152) is guaranteed the next queued
+          (currently RA-141 / FMEA Sys-152) is guaranteed the next queued
           diagram, reserved for it before any other row can consume it.
           Every other New EDO row falls back to the same shared FIFO
           queue as before. Every case where Column H ends up with no
@@ -3832,7 +4085,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
     new_edo_diagram_queue = list(new_edo_diagram_queue) if new_edo_diagram_queue else []
     last_image_row = start_row
 
-    # ---- Reserve a diagram specifically for RA-141 / FMEA SYS-152 ----
+    # ---- Reserve a diagram specifically for RA-141 / FMEA Sys-152 ----
     # Guarantees that record gets an image even if other New EDO rows
     # come first in iteration order and would otherwise drain the FIFO
     # queue before reaching it.
@@ -3841,8 +4094,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
         for candidate_edo in final_edos.values():
             if (
                 candidate_edo.get("edo_type") == "New"
-                and normalize_id(candidate_edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
-                and normalize_id(candidate_edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+                and normalize_id(candidate_edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                and normalize_id(candidate_edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
             ):
                 reserved_target_image = new_edo_diagram_queue.pop(0)
                 logging.info(
@@ -3870,14 +4123,42 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
             # its own location/description/reason, instead of only ever
             # showing the single location that got backfilled onto
             # edo["location"].
-            split_rows = [
-                {
+            #
+            # FIX: the source table often represents one description that
+            # applies to several locations as a single vertically-merged
+            # cell (e.g. a "3X WALL THK" callout covering 3 ports/hoses,
+            # like the 212484 front-housing example - one description,
+            # three locations). The upstream extraction only attaches
+            # that text to the FIRST design element in the list and
+            # leaves description/reason genuinely empty on the remaining
+            # elements, even though the same value applies to them too.
+            # This produced exactly the reported symptom: split row 1
+            # shows the (long, multi-sentence) description while split
+            # rows 2 and 3 of the same EDO tag come out blank. Forward-
+            # fill (carry down the last non-empty value) so every split
+            # row of the merged block shows its description/reason
+            # instead of only the first one.
+            split_rows = []
+            last_description, last_reason = "", ""
+            for element in design_elements:
+                description = element.get("description", "")
+                reason = element.get("reason", "")
+
+                if description:
+                    last_description = description
+                else:
+                    description = last_description
+
+                if reason:
+                    last_reason = reason
+                else:
+                    reason = last_reason
+
+                split_rows.append({
                     "location": element.get("location", ""),
-                    "description_2": element.get("description", ""),
-                    "reason_2": element.get("reason", ""),
-                }
-                for element in design_elements
-            ]
+                    "description_2": description,
+                    "reason_2": reason,
+                })
         else:
             # New EDOs (and any Existing EDO with no design_elements) -
             # original behaviour: regex-split a single concatenated
@@ -3908,8 +4189,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             if is_new:
                 is_target_row = (
-                    normalize_id(edo.get("RA_Number")) == "RA-141"
-                    and normalize_id(edo.get("FMEA_Number")) == "FMEA SYS-152"
+                    normalize_id(edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                    and normalize_id(edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
                 )
 
                 if is_target_row:
@@ -3960,12 +4241,10 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
             }
 
             # --- Risk Classification (Column L) computed first, since
-            # --- Column M's content depends on it ---
-            risk_input = (
-                f"{format_output_text(edo.get('reason_identified') or '')} "
-                f"{format_output_text(edo.get('dfmea') or '')}"
-            )
-            risk = classify_risk_status(risk_input, pipeline_config)
+            # --- Column M's content depends on it. Fixed by EDO type:
+            # --- Existing -> "Medium", New -> "High" (see
+            # --- classify_risk_status()). ---
+            risk = classify_risk_status(is_new, pipeline_config)
             values[12] = risk
 
             # --- Remarks and Recommendation (Column M) ---
@@ -4028,8 +4307,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             is_target_image_row = (
                 is_new
-                and normalize_id(edo.get("RA_Number")) == TARGET_IMAGE_RA_NUMBER
-                and normalize_id(edo.get("FMEA_Number")) == TARGET_IMAGE_FMEA_NUMBER
+                and normalize_id(edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
+                and normalize_id(edo.get("FMEA_Number")) == normalize_id(TARGET_IMAGE_FMEA_NUMBER)
             )
 
             if is_target_image_row and reserved_target_image:
@@ -4372,7 +4651,7 @@ def generate_edo_template(
                 "failed, leaving column E as 'Blank' for this run. "
                 f"Reason: {verification_error}"
             )
-
+        print(f"verirification_details: ", final_edos)
         # ---------------------------------------------------
         # CALL 6B: Traceability Reference extraction - runs right after
         # CALL 6, over the same merged final_edos, one LLM call per
@@ -4399,7 +4678,7 @@ def generate_edo_template(
                 "failed, leaving column E as whatever CALL 6 already set "
                 f"for this run. Reason: {traceability_reference_error}"
             )
-
+        print(f"Traceability details: ", final_edos)
         # ---------------------------------------------------
         # CALL 7 (Traceability / Risk Classification / Remarks and
         # Recommendation) + Output Mapping, Formatting and File
