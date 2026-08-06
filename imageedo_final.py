@@ -144,9 +144,9 @@ def get_edo_document(
     db: DatabaseHandler
 ):
     """
-    CANONICAL version - from edo_existing_final.py.
-    Still resolves EDO_Proposed, EDO_RA_C and EDO_FMEA. Raises if
-    EDO_Proposed (required by every stage) is missing.
+    CANONICAL version - updated to resolve EDO_Proposed, EDO_RA_C, EDO_FMEA,
+    EDO_PDF_New, and 4 Excel documents from Chroma DB.
+    Raises if EDO_Proposed is missing.
     """
     documents = get_template_documents(
         client,
@@ -160,9 +160,11 @@ def get_edo_document(
         raise Exception("No EDO template documents found.")
 
     edo_documents = {}
+    excel_documents = []
 
     for document in documents:
         identity = normalize_text(document.get("document_identity")).lower()
+        doc_name = normalize_text(document.get("document_name")).lower()
         logging.info(f"AVAILABLE DOCUMENT : {identity}")
 
         if identity == "edo_proposed":
@@ -172,16 +174,38 @@ def get_edo_document(
         elif identity in ["edo_fmea", "fmea", "system_fmea"]:
             edo_documents["edo_fmea"] = document
         elif identity in ["edo_pdf_new", "edo_pdf-new", "edo pdf new"]:
-            # Same db-driven resolution pattern as edo_proposed (docx),
-            # just for the PDF source used to pull New EDO diagrams -
-            # see resolve_edo_source_file() / extract_new_edo_diagram_queue().
             edo_documents["edo_pdf_new"] = document
+        # Explicit matching for 4 Excel document identities
+        elif identity in ["edo_excel_1", "excel_1", "edo_excel1", "excel1"]:
+            edo_documents["edo_excel_1"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_2", "excel_2", "edo_excel2", "excel2"]:
+            edo_documents["edo_excel_2"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_3", "excel_3", "edo_excel3", "excel3"]:
+            edo_documents["edo_excel_3"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_4", "excel_4", "edo_excel4", "excel4"]:
+            edo_documents["edo_excel_4"] = document
+            excel_documents.append(document)
+        # Fallback for dynamic Excel files by name extension or identity keyword
+        elif ("excel" in identity or doc_name.endswith((".xlsx", ".xls", ".xlsm", ".csv"))) and len(excel_documents) < 4:
+            excel_key = f"edo_excel_{len(excel_documents) + 1}"
+            if excel_key not in edo_documents:
+                edo_documents[excel_key] = document
+                excel_documents.append(document)
+
+    # Retain full list of Excel document collections for downstream iteration
+    edo_documents["excel_documents"] = excel_documents
 
     logging.info("=" * 80)
     logging.info("EDO DOCUMENT CONFIGURATION")
     logging.info("=" * 80)
 
     for key, doc in edo_documents.items():
+        if key == "excel_documents":
+            logging.info(f"Loaded Total Excel Documents : {len(doc)}")
+            continue
         logging.info(f"{key}")
         logging.info(f"Identity   : {doc.get('document_identity')}")
         logging.info(f"Name       : {doc.get('document_name')}")
@@ -193,13 +217,16 @@ def get_edo_document(
         raise Exception("Required document EDO_Proposed was not found.")
 
     if "edo_pdf_new" not in edo_documents:
-        # Not fatal - New EDO diagram insertion is best-effort, same as
-        # image extraction from edo_proposed. Logged so it's obvious in
-        # the run log why Column H comes back with no diagrams.
         logging.warning(
             "Document with identity 'EDO_pdf_new' was not found in the "
             "template's configured documents - New EDO diagram lookup "
             "(Column H) will be skipped for this run."
+        )
+
+    if len(excel_documents) < 4:
+        logging.warning(
+            f"Expected 4 Excel documents, but found {len(excel_documents)}. "
+            "Pipeline will proceed with available Chroma DB collections."
         )
 
     return edo_documents
@@ -3258,6 +3285,10 @@ def format_traceability_references(traceability_entries):
     return "\n".join(lines)
 
 
+import re
+import json
+import logging
+
 def extract_and_apply_traceability_reference(
     client,
     product_family,
@@ -3265,135 +3296,110 @@ def extract_and_apply_traceability_reference(
     templatename,
     pipeline_config,
     edo_document,
-    final_edos,
-    db: DatabaseHandler
+    records_dict,
+    db
 ):
     """
-    CALL 6B - companion to extract_and_apply_verification_details()
-    (CALL 6), run immediately after it over the same merged
-    `final_edos` dict (Existing + New together).
-
-    Per requirement, the traceability call now works exactly like the
-    verification reference call: ONE LLM call per record (same loop-
-    per-entry pattern), using the "EDO_NEW_Traceability_Reference"
-    prompt. That prompt is required to resolve EVERY individual trace/
-    reference code on the record (DRS-###, MS CU Mod-###, RRAA, etc.)
-    to its OWN specific document reference - never a single combined
-    "Source: ... | Location: ... | Result: ..." blob covering every
-    code at once, which is what was going wrong before.
-
-    The formatted, per-code text (see format_traceability_references())
-    is then MERGED into each record's "verification_reference" field -
-    appended after whatever extract_and_apply_verification_details()
-    already put there - so Column E ends up carrying both pieces
-    together, exactly as requested.
+    Loops through each record's verification reference codes, queries the 4 TM traceability
+    spreadsheets (EDO_TM_1, EDO_TM_2, EDO_TM_3, EDO_TM_4) per code (e.g., DRS-570), extracts File Name,
+    Location (Doc # & Rev), and REQ RESULT values, and formats each result as:
+    "(<extracted tag>) <Location> - <file name>"
     """
     logging.info("=" * 80)
-    logging.info("CALL 6B: TRACEABILITY REFERENCE EXTRACTION (POST-MERGE, PER-RECORD, PER-CODE)")
+    logging.info("STAGE: EXTRACTING VERIFICATION REFERENCE TRACEABILITY (PER-CODE LOOP - TM 1 to 4)")
     logging.info("=" * 80)
 
-    if not final_edos:
-        logging.info("No merged EDO records to extract traceability references for.")
-        return final_edos
+    prompt_data = db.get_prompt_by_name(
+        client,
+        product_family,
+        product,
+        templatename,
+        "EDO_Verification_Traceability"
+    )
 
-    if "edo_fmea" in edo_document:
-        traceability_source_key = "edo_fmea"
-    elif "edo_ra_c" in edo_document:
-        logging.warning(
-            "EDO_FMEA document/collection not found in edo_document - "
-            "falling back to EDO_RA_C (RA&C) as the document identity "
-            "for traceability reference extraction."
-        )
-        traceability_source_key = "edo_ra_c"
-    else:
-        logging.warning(
-            "Neither EDO_FMEA nor EDO_RA_C document/collection is "
-            "configured - skipping traceability reference extraction "
-            "(CALL 6B)."
-        )
-        return final_edos
+    # Regex pattern to catch explicit verification reference codes
+    VERIFICATION_CODE_PATTERN = re.compile(
+        r'\b(?:DRS|SRS-CTRL|MS\s+CU\s+Mod|MS\s+ACC\s+Mod|MRS\s+CU\s+FMEA|MRS\s+Software\s+FMEA|MRS\s+ACC\s+FMEA|RRAA)[-\w]*',
+        re.IGNORECASE
+    )
 
-    try:
-        prompt_data = get_prompt(
-            client,
-            product_family,
-            product,
-            templatename,
-            "EDO_NEW_Traceability_Reference",
-            db
-        )
-    except Exception as e:
-        logging.error(
-            "CALL 6B SKIPPED - could not load the "
-            f"'EDO_NEW_Traceability_Reference' prompt: {e}. Leaving "
-            "verification_reference as whatever CALL 6 already set."
-        )
-        return final_edos
+    # Target document identifiers for the 4 Traceability Spreadsheets
+    TM_KEYS = ["EDO_TM_1", "EDO_TM_2", "EDO_TM_3", "EDO_TM_4"]
 
-    for key, edo in final_edos.items():
-        ra_number = edo.get("RA_Number", "")
-        fmea_number = edo.get("FMEA_Number", "")
+    for record_key, record in records_dict.items():
+        # Retrieve explicit verification codes list or extract from text fields
+        codes_to_process = record.get("verification_codes", [])
 
-        if ra_number in (None, "", "Blank") and fmea_number in (None, "", "Blank"):
-            continue
+        if not codes_to_process:
+            search_text = f"{record.get('dfmea', '')} {record.get('verification_reference', '')}"
+            matches = VERIFICATION_CODE_PATTERN.findall(search_text)
+            # Deduplicate while preserving order
+            codes_to_process = list(dict.fromkeys([m.strip() for m in matches if m.strip()]))
 
-        target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+        formatted_references = []
 
-        prompt_row = {
-            "prompt_role": prompt_data["prompt_role"],
-            "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
-            "question": (
-                f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
-                "only, resolve every individual trace code to its own "
-                "reference as a single JSON object - no other RA/FMEA "
-                "pairs, and no code merged with another."
-            ),
-            "fulltext": "Yes",
-            "where_filter": "",
-            "where_document": "",
-            "checkpoint": ""
-        }
+        for code in codes_to_process:
+            code_clean = normalize_text(code)
+            if not code_clean or code_clean.lower() in ("none", "blank"):
+                continue
 
-        try:
-            _, _, response = execute_llm_retry(
-                pipeline_config,
-                edo_document[traceability_source_key]["collection"],
-                prompt_row
-            )
-            parsed = parse_json(response)
-        except Exception as e:
-            logging.error(
-                f"CALL 6B: traceability LLM call failed for "
-                f"RA={ra_number!r} FMEA={fmea_number!r}: {e}"
-            )
-            continue
+            prompt_row = {
+                "prompt_role": prompt_data["prompt_role"],
+                "prompt_text": prompt_data["prompt_text"].replace("{verification_code}", code_clean),
+                "question": f"Extract verification reference traceability for code: {code_clean}",
+                "fulltext": "Yes",
+                "where_filter": "",
+                "where_document": "",
+                "checkpoint": f"Verification Code Traceability: {code_clean}"
+            }
 
-        records = deep_extract_records(parsed)
-        row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+            # Query across all 4 EDO_TM document collections
+            for tm_key in TM_KEYS:
+                tm_doc = edo_document.get(tm_key, {})
+                collection = tm_doc.get("collection") if isinstance(tm_doc, dict) else None
 
-        traceability_entries = (
-            row.get("Traceability_References")
-            or row.get("traceability_references")
-            or []
-        )
-        if not isinstance(traceability_entries, list):
-            traceability_entries = []
+                if not collection:
+                    continue
 
-        traceability_text = format_traceability_references(traceability_entries)
+                try:
+                    _, _, response = execute_llm_retry(pipeline_config, collection, prompt_row)
+                    parsed = parse_json(response)
 
-        if traceability_text:
-            existing_text = normalize_text(edo.get("verification_reference"))
-            if existing_text and existing_text.lower() != "none":
-                edo["verification_reference"] = f"{existing_text}\n{traceability_text}"
-            else:
-                edo["verification_reference"] = traceability_text
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        parsed = parsed[0]
 
-            logging.info(
-                f"CALL 6B: traceability reference for RA={ra_number!r} "
-                f"FMEA={fmea_number!r} -> {traceability_text!r}"
-            )
+                    ext_tag = normalize_text(get_llm_value(parsed, "Verification_Code", "Trace_Code", "code")) or code_clean
+                    location = normalize_text(get_llm_value(parsed, "Location", "location", "doc_ref"))
+                    file_name = normalize_text(get_llm_value(parsed, "File_Name", "file_name", "title"))
+                    req_result = normalize_text(get_llm_value(parsed, "Req_Result", "req_result", "result"))
 
-    return final_edos
+                    # Ignore empty non-matches for this TM collection
+                    if not location and not file_name:
+                        continue
+
+                    # Format output: "(<extracted tag>) <Location> - <file name>"
+                    if location and file_name:
+                        formatted_entry = f"({ext_tag}) {location} - {file_name}"
+                    elif location:
+                        formatted_entry = f"({ext_tag}) {location}"
+                    else:
+                        formatted_entry = f"({ext_tag}) {file_name}"
+
+                    if req_result:
+                        logging.info(f"[{tm_key}] Code {ext_tag} | REQ RESULT: {req_result}")
+
+                    if formatted_entry not in formatted_references:
+                        formatted_references.append(formatted_entry)
+
+                except Exception as ex:
+                    logging.warning(f"Error processing {tm_key} for verification code {code_clean}: {ex}")
+                    continue
+
+        # Update verification reference field with aggregated results
+        if formatted_references:
+            record["verification_reference"] = "\n".join(formatted_references)
+
+    return records_dict
 
 
 # ==========================================================
