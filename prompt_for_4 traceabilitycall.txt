@@ -1,0 +1,28 @@
+Drs-570, MS CU Mod-97, Ms cu mod-384, MS CU Mod-373, Srs-ctrl-39, Srs-ctrl-39, SRS-CTRL-53, Srs-ctrl-128, Srs-ctrl-128, SRS-CTRL-290, SRS-CTRL-163, SRS-CTRL-168, SRS-CTRL-492, SRS-CTRL-130, SRS-CTRL-140, SRS-CTRL-370, Srs-ctrl-118, Srs-ctrl-118, Srs-ctrl-119 NPD40328 - NPD40328 tdr for titan sw verification via code review Srs-ctrl-119 NPD47568 - sv ctrl 4 sw v&v statement SRS-CTRL-248, Srs-ctrl-51 NPD38844 - sv ctrl 0 sw v&v gui Srs-ctrl-51 NPD45041 - sv ctrl 0 sw v&v gui Srs-ctrl-51 NPD45812 - sv ctrl 1 sw v&v Srs-ctrl-51 NPD47568 - sv ctrl 2 sw v&v gui
+
+
+
+
+Drs-570, MS CU Mod-97, Ms cu mod-384, MS CU Mod-373, Srs-ctrl-39, Srs-ctrl-39, SRS-CTRL-53, Srs-ctrl-128, Srs-ctrl-128, SRS-CTRL-290, SRS-CTRL-163, SRS-CTRL-168, SRS-CTRL-492, SRS-CTRL-130, SRS-CTRL-140, SRS-CTRL-370, Srs-ctrl-118, Srs-ctrl-118, Srs-ctrl-119
+
+question
+
+Extract the Drs-570 details
+
+prompt
+
+instructions:
+Get the latest revision record details and ignore the old revision records
+
+
+OUTPUT FORMAT:
+Return ONLY a valid JSON array of objects - no conversational text, no explanations, no Markdown code fences.
+
+[
+  {
+    "req_tag": "DRS-501",
+    "vv_record_file_name": "vest apx software feature verification result_sw rev 13",
+    "vv_record_location": "npd44896 rev 3",
+    "req_result": "pass"
+  }
+]
