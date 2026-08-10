@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+from typing import List, Dict, Any
 import sys
 import unicodedata
 import zipfile
@@ -144,9 +145,9 @@ def get_edo_document(
     db: DatabaseHandler
 ):
     """
-    CANONICAL version - from edo_existing_final.py.
-    Still resolves EDO_Proposed, EDO_RA_C and EDO_FMEA. Raises if
-    EDO_Proposed (required by every stage) is missing.
+    CANONICAL version - updated to resolve EDO_Proposed, EDO_RA_C, EDO_FMEA,
+    EDO_PDF_New, and 4 Excel documents from Chroma DB.
+    Raises if EDO_Proposed is missing.
     """
     documents = get_template_documents(
         client,
@@ -160,9 +161,11 @@ def get_edo_document(
         raise Exception("No EDO template documents found.")
 
     edo_documents = {}
+    excel_documents = []
 
     for document in documents:
         identity = normalize_text(document.get("document_identity")).lower()
+        doc_name = normalize_text(document.get("document_name")).lower()
         logging.info(f"AVAILABLE DOCUMENT : {identity}")
 
         if identity == "edo_proposed":
@@ -172,16 +175,38 @@ def get_edo_document(
         elif identity in ["edo_fmea", "fmea", "system_fmea"]:
             edo_documents["edo_fmea"] = document
         elif identity in ["edo_pdf_new", "edo_pdf-new", "edo pdf new"]:
-            # Same db-driven resolution pattern as edo_proposed (docx),
-            # just for the PDF source used to pull New EDO diagrams -
-            # see resolve_edo_source_file() / extract_new_edo_diagram_queue().
             edo_documents["edo_pdf_new"] = document
+        # Explicit matching for 4 Excel document identities
+        elif identity in ["edo_excel_1", "excel_1", "edo_excel1", "excel1"]:
+            edo_documents["edo_excel_1"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_2", "excel_2", "edo_excel2", "excel2"]:
+            edo_documents["edo_excel_2"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_3", "excel_3", "edo_excel3", "excel3"]:
+            edo_documents["edo_excel_3"] = document
+            excel_documents.append(document)
+        elif identity in ["edo_excel_4", "excel_4", "edo_excel4", "excel4"]:
+            edo_documents["edo_excel_4"] = document
+            excel_documents.append(document)
+        # Fallback for dynamic Excel files by name extension or identity keyword
+        elif ("excel" in identity or doc_name.endswith((".xlsx", ".xls", ".xlsm", ".csv"))) and len(excel_documents) < 4:
+            excel_key = f"edo_excel_{len(excel_documents) + 1}"
+            if excel_key not in edo_documents:
+                edo_documents[excel_key] = document
+                excel_documents.append(document)
+
+    # Retain full list of Excel document collections for downstream iteration
+    edo_documents["excel_documents"] = excel_documents
 
     logging.info("=" * 80)
     logging.info("EDO DOCUMENT CONFIGURATION")
     logging.info("=" * 80)
 
     for key, doc in edo_documents.items():
+        if key == "excel_documents":
+            logging.info(f"Loaded Total Excel Documents : {len(doc)}")
+            continue
         logging.info(f"{key}")
         logging.info(f"Identity   : {doc.get('document_identity')}")
         logging.info(f"Name       : {doc.get('document_name')}")
@@ -193,13 +218,16 @@ def get_edo_document(
         raise Exception("Required document EDO_Proposed was not found.")
 
     if "edo_pdf_new" not in edo_documents:
-        # Not fatal - New EDO diagram insertion is best-effort, same as
-        # image extraction from edo_proposed. Logged so it's obvious in
-        # the run log why Column H comes back with no diagrams.
         logging.warning(
             "Document with identity 'EDO_pdf_new' was not found in the "
             "template's configured documents - New EDO diagram lookup "
             "(Column H) will be skipped for this run."
+        )
+
+    if len(excel_documents) < 4:
+        logging.warning(
+            f"Expected 4 Excel documents, but found {len(excel_documents)}. "
+            "Pipeline will proceed with available Chroma DB collections."
         )
 
     return edo_documents
@@ -872,6 +900,63 @@ def clean_llm_response(response):
     ).strip()
 
 
+def _salvage_truncated_json_array(text):
+    """
+    Recovers as many complete top-level JSON objects as possible from a
+    '[' ... ']' array whose text was cut off partway through (typically
+    because the LLM hit its max_tokens limit mid-response on a large
+    table). Walks the text tracking brace depth and string/escape state,
+    so it isn't fooled by braces or brackets that appear inside quoted
+    string values. Every '{ ... }' block that closes cleanly before the
+    cutoff is parsed and kept; the dangling partial object at the very
+    end (the one that got cut off) is simply dropped instead of causing
+    the whole batch to be discarded.
+    """
+    start = text.find("[")
+    if start == -1:
+        return []
+
+    objects = []
+    depth = 0
+    obj_start = None
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                candidate = text[obj_start:i + 1]
+                try:
+                    parsed_obj = json.loads(candidate)
+                    if isinstance(parsed_obj, dict):
+                        objects.append(parsed_obj)
+                except Exception:
+                    pass
+                obj_start = None
+
+    return objects
+
+
 def parse_json(response):
     try:
 
@@ -886,7 +971,7 @@ def parse_json(response):
 
         logging.error(f"JSON Parse Error : {e}")
 
-        # FALLBACK - the direct parse failed, most likely because the LLM
+        # FALLBACK 1 - the direct parse failed, most likely because the LLM
         # wrapped the JSON in extra prose/text beyond a plain ```json fence
         # (clean_llm_response only strips a leading/trailing fence, not
         # surrounding text). Try to salvage the first {...} or [...] block
@@ -903,6 +988,25 @@ def parse_json(response):
                 return salvaged
         except Exception as fallback_error:
             logging.error(f"JSON fallback extraction also failed: {fallback_error}")
+
+        # FALLBACK 2 - the response is a JSON array that was cut off mid-way
+        # (e.g. 'Unterminated string' / 'Expecting value' errors partway
+        # through the text) - almost always caused by hitting max_tokens on
+        # a large table. Salvage every complete object that DID come through
+        # before the cutoff rather than discarding the whole response.
+        try:
+            salvaged_objects = _salvage_truncated_json_array(normalize_text(response))
+            if salvaged_objects:
+                logging.warning(
+                    f"JSON response appears TRUNCATED (likely hit max_tokens) - "
+                    f"recovered {len(salvaged_objects)} complete object(s) before the "
+                    f"cutoff point out of a presumably larger table. Consider raising "
+                    f"max_tokens for this extraction or chunking the source table into "
+                    f"smaller batches to avoid losing the remaining rows."
+                )
+                return salvaged_objects
+        except Exception as salvage_error:
+            logging.error(f"Truncated-array salvage also failed: {salvage_error}")
 
         logging.error(response)
 
@@ -3225,176 +3329,409 @@ def get_llm_value(row, *keys):
         return value
     return ""
 
-def format_traceability_references(traceability_entries):
+
+
+def parse_verification_codes(verification_ref_str: str) -> List[str]:
     """
-    Formats a list of {"Trace_Code": ..., "Reference": ...} dicts - the
-    expected shape of the "EDO_NEW_Traceability_Reference" prompt's
-    "Traceability_References" array - into one line per code, e.g.:
-        (DRS-524) NPD43974 Rev 1 - Vest APX System Regulatory Verification TD
-        RRAA - NPD35987
-        (MS CU Mod-448) NPD45862 Rev 3 - TDR for Titan CB and EMC Report
-    A code containing a digit (DRS-524, MS CU Mod-448, ...) is wrapped
-    in parentheses; a purely alphabetic code (RRAA) is shown as-is,
-    separated from its reference by " - ". Entries missing either a
-    code or a reference (or whose reference is "None"/"Blank") are
-    skipped rather than printed half-empty.
+    Parses a verification string into a clean list of individual code strings.
+    Example input: '(DRS-570, MS CU Mod-384, SRS-CTRL-39)'
+    Example output: ['DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39']
     """
-    lines = []
-    for item in traceability_entries or []:
-        if not isinstance(item, dict):
-            continue
+    if not verification_ref_str:
+        return []
+    
+    raw_str = str(verification_ref_str).strip()
+    if raw_str.startswith("(") and raw_str.endswith(")"):
+        raw_str = raw_str[1:-1]
+        
+    codes = [code.strip() for code in raw_str.split(",") if code.strip()]
+    return codes
 
-        code = normalize_text(item.get("Trace_Code") or item.get("trace_code"))
-        reference = normalize_text(item.get("Reference") or item.get("reference"))
 
-        if not code or not reference or reference.lower() in ("none", "blank"):
-            continue
+# Canonical field name -> accepted spellings the raw LLM extraction might use.
+# Used to normalize every record down to exactly the 4 columns we care about
+# (REQ TAG / V/V RECORD FILE NAME / V/V RECORD LOCATION / REQ RESULT) before
+# it's stored in EXCEL_TM_1_Details..EXCEL_TM_4_Details, instead of storing
+# whatever raw/extra keys the LLM happened to return.
+_EXCEL_FIELD_KEY_CANDIDATES = {
+    "req_tag": ["req_tag", "Req_Tag", "REQ_TAG", "reqtag", "Req Tag", "REQ TAG"],
+    "vv_record_file_name": [
+        "vv_record_file_name", "VV_Record_File_Name", "vv_record_filename",
+        "V/V Record File Name", "V/V RECORD FILE NAME", "vv_file_name"
+    ],
+    "vv_record_location": [
+        "vv_record_location", "VV_Record_Location",
+        "V/V Record Location", "V/V RECORD LOCATION"
+    ],
+    "req_result": [
+        "req_result", "Req_Result", "REQ_RESULT",
+        "Req Result", "REQ RESULT", "pass/fail", "Pass/Fail"
+    ],
+}
 
-        if re.search(r'\d', code):
-            lines.append(f"({code}) {reference}")
+
+def _normalize_excel_record(record: dict, source_filename: str) -> dict:
+    """
+    Reduces a raw extracted record down to exactly the 4 canonical fields
+    (req_tag, vv_record_file_name, vv_record_location, req_result) plus
+    _source_filename - regardless of what key spelling the LLM extraction
+    returned. This is what actually gets stored in EXCEL_TM_1_Details..
+    EXCEL_TM_4_Details, so downstream lookups can always rely on these exact
+    keys being present.
+    """
+    clean = {}
+    for canonical_key, candidates in _EXCEL_FIELD_KEY_CANDIDATES.items():
+        value = None
+        for candidate in candidates:
+            v = record.get(candidate)
+            if v not in (None, "", "Blank"):
+                value = v
+                break
+        clean[canonical_key] = value if value is not None else ""
+
+    clean["_source_filename"] = source_filename
+    return clean
+
+
+# Safety cap on how many continuation batches to request per document before
+# giving up - prevents an infinite loop if the LLM keeps claiming there's
+# more data that never actually arrives. 15 batches is generous headroom for
+# even a very large sheet/log file extracted a few hundred rows at a time.
+MAX_EXCEL_EXTRACTION_BATCHES = 40
+
+
+def extract_full_collection_records(
+    pipeline_config: dict,
+    collection,
+    prompt_data: dict,
+    filename: str,
+    target_list_key: str
+) -> List[dict]:
+    """
+    Extracts ALL rows out of a document collection regardless of how large
+    it is, by looping the LLM call instead of relying on a single call to
+    fit the entire document under max_tokens. Every batch after the first
+    explicitly asks the model to continue from the last req_tag it gave us
+    and to return an empty array once nothing is left - so document context
+    is never silently dropped just because one response got truncated.
+
+    Records are normalized (see _normalize_excel_record) and deduplicated
+    by (req_tag, vv_record_location) as they come in, so a batch that
+    re-sends a row already captured doesn't create a duplicate entry.
+    """
+    all_records: List[dict] = []
+    seen_keys = set()
+    last_req_tag = None
+
+    for batch_num in range(1, MAX_EXCEL_EXTRACTION_BATCHES + 1):
+        if last_req_tag is None:
+            question = (
+                "Extract ALL rows in this document that contain a requirement/"
+                "verification code, starting from the very first row. Follow the "
+                "field definitions and output format exactly."
+            )
         else:
-            lines.append(f"{code} - {reference}")
-
-    return "\n".join(lines)
-
-
-def extract_and_apply_traceability_reference(
-    client,
-    product_family,
-    product,
-    templatename,
-    pipeline_config,
-    edo_document,
-    final_edos,
-    db: DatabaseHandler
-):
-    """
-    CALL 6B - companion to extract_and_apply_verification_details()
-    (CALL 6), run immediately after it over the same merged
-    `final_edos` dict (Existing + New together).
-
-    Per requirement, the traceability call now works exactly like the
-    verification reference call: ONE LLM call per record (same loop-
-    per-entry pattern), using the "EDO_NEW_Traceability_Reference"
-    prompt. That prompt is required to resolve EVERY individual trace/
-    reference code on the record (DRS-###, MS CU Mod-###, RRAA, etc.)
-    to its OWN specific document reference - never a single combined
-    "Source: ... | Location: ... | Result: ..." blob covering every
-    code at once, which is what was going wrong before.
-
-    The formatted, per-code text (see format_traceability_references())
-    is then MERGED into each record's "verification_reference" field -
-    appended after whatever extract_and_apply_verification_details()
-    already put there - so Column E ends up carrying both pieces
-    together, exactly as requested.
-    """
-    logging.info("=" * 80)
-    logging.info("CALL 6B: TRACEABILITY REFERENCE EXTRACTION (POST-MERGE, PER-RECORD, PER-CODE)")
-    logging.info("=" * 80)
-
-    if not final_edos:
-        logging.info("No merged EDO records to extract traceability references for.")
-        return final_edos
-
-    if "edo_fmea" in edo_document:
-        traceability_source_key = "edo_fmea"
-    elif "edo_ra_c" in edo_document:
-        logging.warning(
-            "EDO_FMEA document/collection not found in edo_document - "
-            "falling back to EDO_RA_C (RA&C) as the document identity "
-            "for traceability reference extraction."
-        )
-        traceability_source_key = "edo_ra_c"
-    else:
-        logging.warning(
-            "Neither EDO_FMEA nor EDO_RA_C document/collection is "
-            "configured - skipping traceability reference extraction "
-            "(CALL 6B)."
-        )
-        return final_edos
-
-    try:
-        prompt_data = get_prompt(
-            client,
-            product_family,
-            product,
-            templatename,
-            "EDO_NEW_Traceability_Reference",
-            db
-        )
-    except Exception as e:
-        logging.error(
-            "CALL 6B SKIPPED - could not load the "
-            f"'EDO_NEW_Traceability_Reference' prompt: {e}. Leaving "
-            "verification_reference as whatever CALL 6 already set."
-        )
-        return final_edos
-
-    for key, edo in final_edos.items():
-        ra_number = edo.get("RA_Number", "")
-        fmea_number = edo.get("FMEA_Number", "")
-
-        if ra_number in (None, "", "Blank") and fmea_number in (None, "", "Blank"):
-            continue
-
-        target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+            question = (
+                f"You are continuing a previous extraction of this SAME document. "
+                f"The last row already extracted had req_tag '{last_req_tag}'. "
+                f"Continue reading the document from immediately AFTER that row and "
+                f"extract every remaining row that has not already been given - do "
+                f"NOT repeat any row already extracted. Use the exact same JSON "
+                f"field format. If there are no rows left in the document, return "
+                f"exactly this empty JSON array: []"
+            )
 
         prompt_row = {
             "prompt_role": prompt_data["prompt_role"],
-            "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
-            "question": (
-                f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
-                "only, resolve every individual trace code to its own "
-                "reference as a single JSON object - no other RA/FMEA "
-                "pairs, and no code merged with another."
-            ),
+            "prompt_text": prompt_data["prompt_text"],
+            "question": question,
             "fulltext": "Yes",
             "where_filter": "",
             "where_document": "",
-            "checkpoint": ""
+            "checkpoint": f"Extracting {target_list_key} - batch {batch_num}",
+            # Explicitly request a high retrieval ceiling. Without this,
+            # retrieve_content_for_prompt() may fall back to an internal
+            # default max_results that caps how much of the document is
+            # actually fed to the LLM as context - independent of, and
+            # happening BEFORE, the generation-side max_tokens limit. If the
+            # document has 400+ rows but every batch keeps seeing the same
+            # ~54, this retrieval-side cap (not the model deciding it's
+            # done) is the most likely cause.
+            "max_results": 5000
         }
 
         try:
-            _, _, response = execute_llm_retry(
-                pipeline_config,
-                edo_document[traceability_source_key]["collection"],
-                prompt_row
-            )
+            docs, metadata, response = execute_llm_retry(pipeline_config, collection, prompt_row)
+
+            # Diagnostic: how much source content actually reached the LLM
+            # this batch. If this count/size is identical across batches
+            # despite the "continue after X" instruction, retrieval is
+            # feeding the same fixed window every time rather than the
+            # continuation prompt having any effect - confirms a
+            # retrieval-side cap rather than a generation-side one.
+            try:
+                doc_count = len(docs) if docs is not None else 0
+                doc_chars = sum(len(str(d)) for d in docs) if docs else 0
+                logging.info(
+                    f"{target_list_key} batch {batch_num} - retrieved {doc_count} "
+                    f"doc chunk(s), ~{doc_chars} total characters of source context"
+                )
+            except Exception:
+                pass
+
             parsed = parse_json(response)
-        except Exception as e:
+            batch_records = deep_extract_records(parsed)
+
+            if not batch_records and isinstance(parsed, dict) and parsed:
+                batch_records = [parsed]
+
+        except Exception as ex:
             logging.error(
-                f"CALL 6B: traceability LLM call failed for "
-                f"RA={ra_number!r} FMEA={fmea_number!r}: {e}"
+                f"Batch {batch_num} failed for {target_list_key} ('{filename}'): {ex}"
             )
+            break
+
+        if not batch_records:
+            logging.info(
+                f"{target_list_key} ('{filename}') - batch {batch_num} returned no "
+                f"rows, extraction complete. Total collected: {len(all_records)}"
+            )
+            break
+
+        new_count = 0
+        for record in batch_records:
+            normalized = _normalize_excel_record(record, filename)
+            dedup_key = (normalized["req_tag"], normalized["vv_record_location"])
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            all_records.append(normalized)
+            new_count += 1
+
+        logging.info(
+            f"{target_list_key} ('{filename}') - batch {batch_num}: "
+            f"{len(batch_records)} rows returned, {new_count} new after dedup "
+            f"(running total: {len(all_records)})"
+        )
+
+        if new_count == 0:
+            # The model returned rows but every one was already captured -
+            # it's not making progress, so stop rather than looping forever.
+            logging.info(
+                f"{target_list_key} ('{filename}') - batch {batch_num} produced no "
+                f"new rows, stopping (likely reached the end)."
+            )
+            break
+
+        last_req_tag = all_records[-1]["req_tag"] or last_req_tag
+
+    return all_records
+
+
+def extract_excel_sheets_to_separate_lists(
+    client,
+    product_family: str,
+    product: str,
+    templatename: str,
+    pipeline_config: dict,
+    edo_document: dict,
+    db: Any
+) -> Dict[str, List[dict]]:
+    """
+    Queries the LLM/database once for each Excel spreadsheet document collection 
+    and stores results into distinct list variables.
+    """
+    logging.info("=" * 80)
+    logging.info("STAGE 1: EXTRACTING EXCEL DETAILS INTO SEPARATE LISTS")
+    logging.info("=" * 80)
+
+    excel_documents = edo_document.get("excel_documents", [])
+    
+    # Pre-allocate key list names dynamically
+    excel_lists = {
+        "EXCEL_TM_1_Details": [],
+        "EXCEL_TM_2_Details": [],
+        "EXCEL_TM_3_Details": [],
+        "EXCEL_TM_4_Details": []
+    }
+
+    try:
+        prompt_data = get_prompt(
+            client, product_family, product, templatename, "EDO_Excel_Extraction", db
+        )
+    except Exception as e:
+        logging.error(f"Failed to load extraction prompt: {e}")
+        return excel_lists
+
+    list_keys = list(excel_lists.keys())
+
+    for idx, excel_doc in enumerate(excel_documents[:4]):
+        target_list_key = list_keys[idx]
+        collection = excel_doc.get("collection")
+        filename = excel_doc.get("document_identity", f"Excel_Doc_{idx+1}")
+
+        if not collection:
             continue
 
-        records = deep_extract_records(parsed)
-        row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+        logging.info(f"Querying Collection {idx+1} ({filename}) -> Target Variable: {target_list_key}")
 
-        traceability_entries = (
-            row.get("Traceability_References")
-            or row.get("traceability_references")
-            or []
-        )
-        if not isinstance(traceability_entries, list):
-            traceability_entries = []
-
-        traceability_text = format_traceability_references(traceability_entries)
-
-        if traceability_text:
-            existing_text = normalize_text(edo.get("verification_reference"))
-            if existing_text and existing_text.lower() != "none":
-                edo["verification_reference"] = f"{existing_text}\n{traceability_text}"
-            else:
-                edo["verification_reference"] = traceability_text
-
-            logging.info(
-                f"CALL 6B: traceability reference for RA={ra_number!r} "
-                f"FMEA={fmea_number!r} -> {traceability_text!r}"
+        try:
+            # Paginated extraction: loops the LLM call in batches, each one
+            # continuing from the last row already captured, instead of a
+            # single call that can silently truncate on a large document -
+            # see extract_full_collection_records() for the batching logic.
+            normalized_records = extract_full_collection_records(
+                pipeline_config,
+                collection,
+                prompt_data,
+                filename,
+                target_list_key
             )
 
-    return final_edos
+            excel_lists[target_list_key] = normalized_records
 
+            if normalized_records:
+                logging.info(f"Successfully loaded {len(normalized_records)} items into {target_list_key}")
+            else:
+                logging.error(
+                    f"ZERO usable items loaded into {target_list_key} from '{filename}' - "
+                    f"the LLM response could not be parsed as JSON at all (see JSON Parse "
+                    f"Error / truncation warning above). Verification codes from this sheet "
+                    f"will legitimately show as 'No match found' until this extraction is re-run."
+                )
+
+        except Exception as ex:
+            logging.error(f"Failed to extract details for {target_list_key}: {ex}")
+
+    return excel_lists
+
+
+def build_final_edos_with_traceability(
+    merged_edos: Dict[str, dict],
+    excel_lists: Dict[str, List[dict]]
+) -> List[dict]:
+    """
+    For every merged EDO record, parses its verification_reference string into
+    individual codes (e.g. 'DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39') and
+    resolves EACH code ONE AT A TIME purely by searching the 4 already-loaded
+    Excel lists (EXCEL_TM_1_Details .. EXCEL_TM_4_Details) that were built once
+    in extract_excel_sheets_to_separate_lists(). No LLM/DB call is made here -
+    this stage is a pure in-memory lookup against those 4 lists.
+
+    For each code, whichever Excel list contains it contributes its filename,
+    location, and result text. Every code's outcome (match or no-match) is
+    logged individually together with the owning EDO's RA_Number/FMEA_Number
+    for identification/debugging purposes.
+
+    The combined, human-readable trace text for all of a record's codes is
+    written back onto `verification_reference` (the same column
+    format_edo_worksheet() reads into the output Excel), so the match results
+    actually show up in the generated workbook. The raw parsed code list is
+    also kept under `verification_reference_parsed` for anyone who needs the
+    individual codes rather than the formatted text.
+    """
+    logging.info("=" * 80)
+    logging.info("STAGE 2: MATCHING TRACEABILITY CODES ACROSS EXCEL LISTS (LOCAL LOOKUP ONLY - NO LLM CALLS)")
+    logging.info("=" * 80)
+
+    final_edos = []
+
+    # Explicit field names for each of the 4 fixed columns coming out of the
+    # Excel/log extraction (see logs.txt): REQ TAG (Col A), V/V RECORD FILE
+    # NAME (Col C), V/V RECORD LOCATION (Col D), REQ RESULT / PASS-FAIL (Col E).
+    # A short list of accepted key spellings is kept per field only to absorb
+    # harmless casing/underscore variance from the LLM extraction step - the
+    # match itself is always done against req_tag specifically, never a
+    # blind substring-of-the-whole-record search.
+    REQ_TAG_KEYS = ["req_tag", "Req_Tag", "REQ_TAG", "reqtag"]
+    VV_FILE_NAME_KEYS = ["vv_record_file_name", "VV_Record_File_Name", "vv_record_filename"]
+    VV_LOCATION_KEYS = ["vv_record_location", "VV_Record_Location"]
+    REQ_RESULT_KEYS = ["req_result", "Req_Result", "REQ_RESULT"]
+
+    def _first(item: dict, *keys):
+        """Return the first non-empty value found in `item` for any of `keys`."""
+        for k in keys:
+            val = item.get(k)
+            if val not in (None, "", "Blank"):
+                return val
+        return None
+
+    def _normalize_code(value) -> str:
+        """Normalizes a code/req_tag for comparison: uppercase, strip all
+        non-alphanumeric separators, so 'DRS-570', 'drs 570', 'DRS570' all
+        compare equal regardless of dash/space/case differences."""
+        if value is None:
+            return ""
+        return re.sub(r'[^A-Za-z0-9]', '', str(value)).upper()
+
+    for key, edo_record in merged_edos.items():
+        # Create a copy to prevent mutation issues
+        final_record = dict(edo_record)
+
+        ra_number = final_record.get("RA_Number", "")
+        fmea_number = final_record.get("FMEA_Number", "")
+
+        ver_ref_str = final_record.get("verification_reference", "")
+        parsed_codes = parse_verification_codes(ver_ref_str)
+
+        matched_trace_details = []
+
+        logging.info("-" * 80)
+        logging.info(
+            f"EDO Tag: {key!r} | RA_Number: {ra_number!r} | FMEA_Number: {fmea_number!r} "
+            f"-> Verification codes to resolve: {parsed_codes}"
+        )
+
+        for code in parsed_codes:
+            code_matched = False
+            normalized_code = _normalize_code(code)
+
+            # Walk each of the 4 lists individually (EXCEL_TM_1..4_Details) so the
+            # source list name is known for logging - still zero LLM/DB calls.
+            for list_name, excel_items in excel_lists.items():
+                for excel_item in excel_items:
+                    req_tag_value = _first(excel_item, *REQ_TAG_KEYS)
+                    if req_tag_value is None:
+                        continue
+                    if _normalize_code(req_tag_value) != normalized_code:
+                        continue
+
+                    code_matched = True
+                    filename = _first(excel_item, *VV_FILE_NAME_KEYS) \
+                        or excel_item.get("_source_filename", "Unknown File")
+                    location = _first(excel_item, *VV_LOCATION_KEYS) or "N/A"
+                    result_text = _first(excel_item, *REQ_RESULT_KEYS) or "N/A"
+
+                    # Final output format the user wants in the Excel cell:
+                    # "<Req_Tag> <V/V RECORD LOCATION> - <V/V RECORD FILE NAME>"
+                    trace_entry = f"{req_tag_value} {location} - {filename}"
+                    matched_trace_details.append(trace_entry)
+
+                    logging.info(
+                        f"  MATCH    | List: {list_name} | Code: {code} | "
+                        f"RA_Number: {ra_number!r} | FMEA_Number: {fmea_number!r} | "
+                        f"req_tag: {req_tag_value} | File: {filename} | "
+                        f"Location: {location} | Result: {result_text}"
+                    )
+
+            if not code_matched:
+                matched_trace_details.append(f"{code} - No match found")
+                logging.info(
+                    f"  NO MATCH | Code: {code} | RA_Number: {ra_number!r} | "
+                    f"FMEA_Number: {fmea_number!r} - not found in any of the 4 Excel lists"
+                )
+
+        # Assign the resolved trace text back onto verification_reference itself -
+        # this is the field format_edo_worksheet() writes into the output Excel,
+        # so the resolved location/filename/result now actually reach the sheet.
+        final_record["verification_reference_parsed"] = parsed_codes
+        final_record["verification_reference"] = "\n".join(matched_trace_details)
+
+        final_edos.append(final_record)
+
+    logging.info("-" * 80)
+    logging.info(f"Processed {len(final_edos)} records into final_edos.")
+    return final_edos
 
 # ==========================================================
 # COMMON PROCESSING PIPELINE
@@ -3490,23 +3827,22 @@ def _flatten_record_values(record):
             yield text
 
 
-def get_llm_value(row, *keys):
-    """
-    Returns the first valid, non-empty value found across `keys`.
-    Treats None, "", and any case-insensitive "none"/"blank" placeholder
-    text (e.g. "None", "NONE", "Blank") as invalid/empty, so literal
-    placeholder strings coming back from the LLM never get written to
-    the output Excel as if they were real data.
-    """
-    for key in keys:
-        value = row.get(key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text == "" or text.lower() in ("none", "blank"):
-            continue
-        return value
-    return ""
+# NOTE: a SECOND, older/broken definition of get_llm_value() used to
+# live here (exact `row.get(key)` lookup, no key normalization). Since
+# Python resolves a module-level function name from whatever was bound
+# to it LAST at import time, that duplicate silently shadowed the
+# fixed, key-normalizing get_llm_value() defined earlier in this file
+# (see its docstring/comments above) for EVERY caller in the whole
+# module - not just CALL 6. That is exactly why the verification
+# reference case failed: the LLM answered with the key
+# "Verification_reference" (lowercase "r"), the caller asked for
+# "Verification_Reference"/"Verification Reference"/"verification_reference",
+# and the shadowing exact-match version returned "" even though the
+# parsed JSON clearly had a usable value (visible in the "PARSED JSON"
+# / "EXTRACTED ROW" debug logs, right before "CLEANED VERIFICATION
+# VALUE" always came out empty). The duplicate has been removed so the
+# single, correct get_llm_value() (defined above, with
+# _normalize_llm_key()-based matching) is the only one in scope.
 
 
 FIXED_SYSDD_REFERENCE = "NPD38119 Titan Hardware Detailed Design"
@@ -4091,7 +4427,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
     # queue before reaching it.
     reserved_target_image = None
     if new_edo_diagram_queue:
-        for candidate_edo in final_edos.values():
+        for candidate_edo in final_edos:
             if (
                 candidate_edo.get("edo_type") == "New"
                 and normalize_id(candidate_edo.get("RA_Number")) == normalize_id(TARGET_IMAGE_RA_NUMBER)
@@ -4105,7 +4441,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                 )
                 break
 
-    for key, edo in final_edos.items():
+    for key, edo in enumerate(final_edos):
+        edo_id = edo.get("edo_id", key)  # Fallback to index if key missing
 
         is_new = edo.get("edo_type") == "New"
 
@@ -4437,8 +4774,7 @@ def generate_edo_template(
 
     try:
         # ---------------------------------------------------
-        # Load all documents from the database first, then load the
-        # Excel template - see DOCUMENT RETRIEVAL above.
+        # Load all documents from the database first
         # ---------------------------------------------------
         edo_document = get_edo_document(
             client,
@@ -4455,13 +4791,7 @@ def generate_edo_template(
         clear_existing_rows(sheet, start_row, end_column=10)
 
         # ---------------------------------------------------
-        # STAGE 3 (image extraction): pull embedded images out of the
-        # SAME "edo_proposed" document that extract_edo_tags() below
-        # queries for Existing EDO tags - no separate document lookup.
-        # Non-fatal: if the DatabaseHandler doesn't yet expose a way to
-        # fetch the raw file (see resolve_edo_source_file()), this is
-        # logged and the pipeline continues without images rather than
-        # failing the whole run.
+        # Image extraction
         # ---------------------------------------------------
         try:
             edo_proposed_images = extract_edo_proposed_images(edo_document, pipeline_config)
@@ -4496,10 +4826,7 @@ def generate_edo_template(
 
         if existing_edos:
             # -----------------------------------------------
-            # CALL 2: Extract Existing EDO details (EXCEPT verification
-            # reference - that field is left "" here on purpose; see
-            # CALL 6 below, which is the only place verification
-            # reference gets populated, for every record at once).
+            # CALL 2: Extract Existing EDO details
             # -----------------------------------------------
             existing_edos = extract_edo_details(
                 client,
@@ -4513,8 +4840,7 @@ def generate_edo_template(
             )
 
             # -----------------------------------------------
-            # CALL 3: Extract Existing EDO trace details (Column D,
-            # appended below the RA/FMEA data, same row)
+            # CALL 3: Extract Existing EDO trace details
             # -----------------------------------------------
             try:
                 existing_trace_details = extract_existing_edo_trace_details(
@@ -4540,7 +4866,7 @@ def generate_edo_template(
                     f"Reason: {trace_error}"
                 )
 
-            print(f"extractedt existing edo trace: ", existing_edos)
+            print(f"extracted existing edo trace: ", existing_edos)
 
         # ---------------------------------------------------
         # CALL 4: Extract New EDO tags
@@ -4557,9 +4883,7 @@ def generate_edo_template(
         print(f"extract_new_edo_tags: ", edo_new_data)
 
         # ---------------------------------------------------
-        # CALL 4.5: Filter New EDO tags by Risk Evaluation - only rows
-        # whose Risk Evaluation (from EDO_FMEA) is "Medium" survive into
-        # edo_new_data; everything else is dropped before CALL 5 runs.
+        # CALL 4.5: Filter New EDO tags by Risk Evaluation
         # ---------------------------------------------------
         edo_new_data = filter_new_edo_by_risk_evaluation(
             client,
@@ -4574,8 +4898,7 @@ def generate_edo_template(
         print(f"filter_new_edo_by_risk_evaluation: ", edo_new_data)
 
         # ---------------------------------------------------
-        # CALL 5: Extract New EDO summary details (EXCEPT verification
-        # reference - same reasoning as CALL 2 above; see CALL 6).
+        # CALL 5: Extract New EDO summary details
         # ---------------------------------------------------
         edo_new_data = extract_new_edo_summary_details(
             client,
@@ -4589,14 +4912,10 @@ def generate_edo_template(
         )
         print(f"extract_new_edo_summary_details: ", edo_new_data)
 
-        # new_records MUST be defined here - the merge step below
-        # depends on it.
         new_records = list(edo_new_data.values())
 
         # ---------------------------------------------------
-        # New EDO Diagram Extraction (content-blind, FIFO into Column H
-        # - no RA/FMEA matching inside the PDF at all). Independent of
-        # the record pipeline, so it can run any time before formatting.
+        # New EDO Diagram Extraction
         # ---------------------------------------------------
         try:
             new_edo_diagram_queue = extract_new_edo_diagram_queue(
@@ -4611,11 +4930,7 @@ def generate_edo_template(
             )
 
         # ---------------------------------------------------
-        # MERGE: combine everything CALL 1-5 have gathered so far -
-        # Existing EDOs (tags + details + trace) and New EDOs (tags +
-        # summary) - into ONE final_edos dictionary, de-duplicated
-        # against Existing. Happens BEFORE verification reference
-        # extraction so CALL 6 can run exactly once, over every record.
+        # MERGE: Combine Existing and New EDOs
         # ---------------------------------------------------
         new_final = merge_new_edo_records(
             new_records,
@@ -4630,9 +4945,7 @@ def generate_edo_template(
             raise Exception("No EDO records generated.")
 
         # ---------------------------------------------------
-        # CALL 6: Verification Reference extraction - SINGLE unified
-        # call over the merged final_edos (Existing + New together),
-        # one LLM call per record, same pattern as CALL 5.
+        # CALL 6: Verification Reference extraction
         # ---------------------------------------------------
         try:
             final_edos = extract_and_apply_verification_details(
@@ -4651,40 +4964,51 @@ def generate_edo_template(
                 "failed, leaving column E as 'Blank' for this run. "
                 f"Reason: {verification_error}"
             )
-        print(f"verirification_details: ", final_edos)
+        print(f"verification_details: ", final_edos)
+
         # ---------------------------------------------------
-        # CALL 6B: Traceability Reference extraction - runs right after
-        # CALL 6, over the same merged final_edos, one LLM call per
-        # record. Resolves each individual trace code (DRS-###, MS CU
-        # Mod-###, RRAA, ...) to its own specific document reference and
-        # merges the formatted result into verification_reference, so
-        # Column E carries both verification and traceability content
-        # together.
+        # CALL 6B: Stage 1 - Pre-Extract 4 Excel Collections into Separate Lists
         # ---------------------------------------------------
+        excel_details = {
+            "EXCEL_TM_1_Details": [],
+            "EXCEL_TM_2_Details": [],
+            "EXCEL_TM_3_Details": [],
+            "EXCEL_TM_4_Details": []
+        }
+        
         try:
-            final_edos = extract_and_apply_traceability_reference(
+            excel_details = extract_excel_sheets_to_separate_lists(
                 client,
                 product_family,
                 product,
                 templatename,
                 pipeline_config,
                 edo_document,
-                final_edos,
                 db
+            )
+        except Exception as excel_extract_error:
+            logging.warning(
+                "EXCEL EXTRACTION SKIPPED - failed to extract details into 4 lists. "
+                f"Reason: {excel_extract_error}"
+            )
+
+        # ---------------------------------------------------
+        # CALL 6B: Stage 2 - In-Memory Traceability Matching
+        # ---------------------------------------------------
+        try:
+            final_edos = build_final_edos_with_traceability(
+                final_edos,
+                excel_details
             )
         except Exception as traceability_reference_error:
             logging.warning(
-                "CALL 6B SKIPPED - traceability reference extraction "
-                "failed, leaving column E as whatever CALL 6 already set "
-                f"for this run. Reason: {traceability_reference_error}"
+                "CALL 6B SKIPPED - traceability reference lookup failed. "
+                f"Reason: {traceability_reference_error}"
             )
         print(f"Traceability details: ", final_edos)
+
         # ---------------------------------------------------
-        # CALL 7 (Traceability / Risk Classification / Remarks and
-        # Recommendation) + Output Mapping, Formatting and File
-        # Storage - format_edo_worksheet() runs CALL 7 once per merged
-        # record internally (see classify_risk_status() /
-        # generate_remarks_and_recommendation()).
+        # CALL 7: Output Mapping, Formatting, and Storage
         # ---------------------------------------------------
         format_edo_worksheet(
             sheet,
