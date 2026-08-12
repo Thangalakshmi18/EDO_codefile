@@ -1,5 +1,6 @@
 import os
 import re
+import ast
 import json
 import time
 import logging
@@ -12,6 +13,7 @@ import hashlib
 import math
 import openpyxl
 import fitz
+from PIL import Image as PILImage, ImageDraw
 
 from openpyxl.styles import (
     Alignment,
@@ -655,7 +657,91 @@ def is_valid_rect(rect):
     return True
 
 
-def extract_pdf_page_diagrams(pdf_path, output_dir=IMAGE_OUTPUT_DIR):
+def _diagram_clip_rect(
+    page,
+    region,
+    padding_left=20,
+    padding_right=20,
+    padding_top=20,
+    padding_bottom=20,
+):
+    """Convert an unrotated PDF content rect into displayed page coordinates."""
+    source_bounds = fitz.Rect(page.cropbox)
+    padded = fitz.Rect(
+        max(source_bounds.x0, region.x0 - padding_left),
+        max(source_bounds.y0, region.y0 - padding_top),
+        min(source_bounds.x1, region.x1 + padding_right),
+        min(source_bounds.y1, region.y1 + padding_bottom),
+    )
+
+    # Drawing, image, and text-block coordinates are returned in the
+    # unrotated PDF coordinate system. get_pixmap() clips in displayed
+    # coordinates, so pages stored with /Rotate=90 must be transformed
+    # before rendering. Without this conversion, the result is a tall
+    # page strip or an almost complete page instead of the diagram.
+    if page.rotation:
+        padded = padded * page.rotation_matrix
+
+    page_bounds = fitz.Rect(page.rect)
+    clip = fitz.Rect(
+        max(page_bounds.x0, padded.x0),
+        max(page_bounds.y0, padded.y0),
+        min(page_bounds.x1, padded.x1),
+        min(page_bounds.y1, padded.y1),
+    )
+
+    # Technical-drawing page borders and zone labels sit at the extreme
+    # displayed edge. When padding reaches that edge, trim the narrow frame
+    # band while retaining the actual diagram and its callouts.
+    if clip.x1 >= page_bounds.x1 - 1:
+        clip.x1 = min(clip.x1, page_bounds.x0 + page_bounds.width * 0.95)
+    return clip
+
+
+def _save_diagram_pixmap(pix, page, clip_rect, filepath):
+    """Save a diagram crop after masking lower-left drawing metadata text."""
+    mode = "RGBA" if pix.n == 4 else "RGB"
+    image = PILImage.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+    metadata_rects = []
+    for block in page.get_text("blocks"):
+        rect = fitz.Rect(block[0], block[1], block[2], block[3])
+        display_rect = rect * page.rotation_matrix if page.rotation else rect
+        if (
+            display_rect.x1 <= page.rect.width * 0.22
+            and display_rect.y0 >= page.rect.height * 0.32
+        ):
+            metadata_rects.append(display_rect)
+
+    if metadata_rects:
+        metadata_bbox = fitz.Rect(metadata_rects[0])
+        for rect in metadata_rects[1:]:
+            metadata_bbox |= rect
+
+        visible = metadata_bbox & clip_rect
+        if is_valid_rect(visible):
+            scale_x = pix.width / clip_rect.width
+            scale_y = pix.height / clip_rect.height
+            left = max(0, int((visible.x0 - clip_rect.x0) * scale_x) - 8)
+            top = max(0, int((visible.y0 - clip_rect.y0) * scale_y) - 8)
+            right = min(pix.width, int((visible.x1 - clip_rect.x0) * scale_x) + 8)
+            bottom = min(pix.height, int((visible.y1 - clip_rect.y0) * scale_y) + 8)
+            ImageDraw.Draw(image).rectangle(
+                (left, top, right, bottom),
+                fill=(255, 255, 255, 255) if mode == "RGBA" else (255, 255, 255),
+            )
+
+    image.save(filepath, format="PNG")
+
+
+def extract_pdf_page_diagrams(
+    pdf_path,
+    output_dir=IMAGE_OUTPUT_DIR,
+    padding_left=20,
+    padding_right=20,
+    padding_top=20,
+    padding_bottom=20,
+):
     """
     Fresh, content-blind diagram extractor for EDO_pdf_new.
 
@@ -693,15 +779,23 @@ def extract_pdf_page_diagrams(pdf_path, output_dir=IMAGE_OUTPUT_DIR):
                 continue
 
             try:
-                PAD = 20
-                clip_rect = fitz.Rect(
-                    max(0, region.x0 - PAD), max(0, region.y0 - PAD),
-                    min(page.rect.x1, region.x1 + PAD), min(page.rect.y1, region.y1 + PAD)
+                clip_rect = _diagram_clip_rect(
+                    page,
+                    region,
+                    padding_left=padding_left,
+                    padding_right=padding_right,
+                    padding_top=padding_top,
+                    padding_bottom=padding_bottom,
                 )
+                if not is_valid_rect(clip_rect):
+                    logging.warning(
+                        f"PAGE {page_no} SKIPPED - detected drawing produced an invalid clip rect."
+                    )
+                    continue
                 pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip_rect, alpha=False)
                 filename = f"NEW_EDO_DIAGRAM_p{page_no}.png"
                 filepath = os.path.join(output_dir, filename)
-                pix.save(filepath)
+                _save_diagram_pixmap(pix, page, clip_rect, filepath)
                 with open(filepath, "rb") as f:
                     data = f.read()
                 diagrams.append({"name": filename, "bytes": data, "extension": ".png"})
@@ -742,7 +836,10 @@ def _get_drawing_region(page, proximity=150, paragraph_char_threshold=80, paragr
 
     Returns a fitz.Rect, or None if no drawing content was found.
     """
-    page_w, page_h = page.rect.width, page.rect.height
+    # Source objects use unrotated PDF coordinates even when page.rect is
+    # rotated for display. Use cropbox dimensions for source-space
+    # clustering and page-border filtering.
+    page_w, page_h = page.cropbox.width, page.cropbox.height
     content_bboxes = []
 
     # Embedded raster images (if any)
@@ -835,18 +932,45 @@ def _get_drawing_region(page, proximity=150, paragraph_char_threshold=80, paragr
                     changed = True
 
     # Pull in small nearby labels (dimensions/callouts), but SKIP large
-    # paragraph-style text blocks even if they're nearby.
+    # paragraph-style text blocks even if they're nearby. Keep the search
+    # box fixed: allowing every included label to grow the next search box
+    # creates a chain into DESCRIPTION, NOTES, and title-block content.
+    drawing_bbox = fitz.Rect(main_bbox)
+    drawing_display_bbox = (
+        drawing_bbox * page.rotation_matrix if page.rotation else drawing_bbox
+    )
+    label_search_bbox = fitz.Rect(
+        drawing_bbox.x0 - proximity,
+        drawing_bbox.y0 - proximity,
+        drawing_bbox.x1 + proximity,
+        drawing_bbox.y1 + proximity,
+    )
     for block in page.get_text("blocks"):
         bx0, by0, bx1, by1, text = block[0], block[1], block[2], block[3], block[4]
         rect = fitz.Rect(bx0, by0, bx1, by1)
+        display_rect = rect * page.rotation_matrix if page.rotation else rect
         is_paragraph = (
             len(text.strip()) > paragraph_char_threshold
-            or rect.height > paragraph_height_threshold
+            or display_rect.height > paragraph_height_threshold
         )
         if is_paragraph:
             continue
-        expanded = fitz.Rect(main_bbox.x0 - proximity, main_bbox.y0 - proximity, main_bbox.x1 + proximity, main_bbox.y1 + proximity)
-        if expanded.intersects(rect):
+
+        is_page_frame_label = (
+            display_rect.width > 0.75 * page.rect.width
+            and display_rect.height < paragraph_height_threshold
+        )
+        if is_page_frame_label:
+            continue
+
+        is_lower_left_metadata = (
+            display_rect.x1 < drawing_display_bbox.x0
+            and display_rect.y0 > drawing_display_bbox.y0 + drawing_display_bbox.height * 0.5
+        )
+        if is_lower_left_metadata:
+            continue
+
+        if label_search_bbox.intersects(rect):
             main_bbox |= rect
 
     return main_bbox
@@ -1050,13 +1174,22 @@ def blank(value):
     return text
 
 
-def call_llm(prompt, pipeline_config):
+def call_llm(prompt, pipeline_config, question="generate content"):
+    # NOTE: `question` used to be hardcoded to "risk classification"
+    # here regardless of what the prompt actually asked for. That mislabel
+    # was silently degrading unrelated callers (e.g. recommendation/warning
+    # text generation in generate_recommendation_text()) since the LLM was
+    # being told it was doing risk classification while receiving a full
+    # free-text recommendation prompt - producing short/blank-ish answers
+    # that then failed is_meaningful_llm_text() and got dropped from
+    # Column M entirely. Callers now pass their own `question` so the LLM
+    # is routed correctly for the content they're actually requesting.
     try:
         llm = pipeline_config["llm"]
         response = llm.generate(
             prompt,
             context="",
-            question="risk classification",
+            question=question,
             temperature=pipeline_config["temperature"],
             max_tokens=pipeline_config["max_tokens"]
         )
@@ -2379,7 +2512,7 @@ def extract_new_edo_summary_details(
             "question": (
                 f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
                 "only, extract the full EDO detail record as a single "
-                "JSON object - no other RA/FMEA pairs."
+                "JSON object, including Risk_Status - no other RA/FMEA pairs."
             ),
             "fulltext": "Yes",
             "where_filter": "",
@@ -2435,6 +2568,24 @@ def extract_new_edo_summary_details(
             keys_to_remove.append(key)
             continue
 
+        entry["Risk_Status"] = normalize_text(
+            get_llm_value(
+                detail_row,
+                "Risk_Status",
+                "Risk Status",
+                "risk_status",
+                "RiskStatus",
+            )
+        )
+        if entry["Risk_Status"].casefold() != "medium":
+            logging.info(
+                f"Excluding New EDO RA={ra_number!r} FMEA={fmea_number!r} "
+                f"because Risk_Status={entry['Risk_Status']!r}; only "
+                "Risk_Status='Medium' records are eligible for merging."
+            )
+            keys_to_remove.append(key)
+            continue
+
         entry["Product_Feature_Function"] = get_llm_value(
             detail_row, "Product_Feature_Function", "Product Feature Function"
         )
@@ -2460,14 +2611,16 @@ def extract_new_edo_summary_details(
             detail_row, "Reason_Identified_as_EDO_ColH", "reason_2"
         )
 
-    # Remove entries that had no detail record returned.
+    # Remove records with no details and records whose Risk_Status is
+    # missing or anything other than Medium before the Existing/New merge.
     for key in keys_to_remove:
         del edo_new_data[key]
 
     logging.info(
         f"extract_new_edo_summary_details: enriched {len(edo_new_data)} "
         f"entries in edo_new_data with full detail records "
-        f"({len(keys_to_remove)} excluded due to missing details)."
+        f"({len(keys_to_remove)} excluded due to missing details or a "
+        "non-Medium Risk_Status)."
     )
 
     return edo_new_data
@@ -2478,23 +2631,56 @@ def extract_new_edo_summary_details(
 # ==========================================================
 # Merges Existing EDO records + New EDO records (de-duplicated against Existing) into ONE common list/dict. Everything after this point works on the merged list only.
 
-def get_existing_identifier_set(existing_edos):
+
+def canonical_ra_id(value):
+    """Return an RA identifier in canonical ``RA-<digits>`` form."""
+    match = re.search(r"\bRA\s*[-:#]?\s*(\d+)\b", normalize_text(value), re.IGNORECASE)
+    return f"RA-{match.group(1)}" if match else ""
+
+
+def canonical_fmea_id(value):
+    """Return System FMEA variants in canonical ``SYS-<digits>`` form."""
+    match = re.search(
+        r"\b(?:FMEA\s*)?(?:SYSTEM\s*)?SYS\s*[-:#]?\s*(\d+)\b",
+        normalize_text(value),
+        re.IGNORECASE,
+    )
+    return f"SYS-{match.group(1)}" if match else ""
+
+
+def get_existing_identifier_pairs(existing_edos):
     """
-    Builds a set of every RA Number / FMEA Number already tracked under
-    the Existing EDOs (Stage 3), normalized to uppercase for
-    case-insensitive comparison. Used to drop any "New EDO" record whose
-    RA id or FMEA id is already represented by an Existing EDO, so the
-    same underlying issue is never printed twice.
+    Builds a set of (RA Number, FMEA Number) pairs from Existing EDOs.
+
+    A New EDO is a duplicate only when BOTH values match the same
+    Existing EDO.
+
+    Supports both possible field-name variants:
+        ra_number / RA_Number
+        fmea_number / FMEA_Number
     """
-    identifiers = set()
+
+    existing_pairs = set()
+
     for edo in existing_edos.values():
-        ra = normalize_text(edo.get("ra_number")).upper()
-        fmea = normalize_text(edo.get("FMEA_Number")).upper()
-        if ra:
-            identifiers.add(ra)
-        if fmea:
-            identifiers.add(fmea)
-    return identifiers
+        if not isinstance(edo, dict):
+            continue
+
+        dfmea = edo.get("dfmea", "")
+        ra_key = canonical_ra_id(
+            edo.get("ra_number") or edo.get("RA_Number") or dfmea
+        )
+        fmea_key = canonical_fmea_id(
+            edo.get("fmea_number") or edo.get("FMEA_Number") or dfmea
+        )
+
+        # Only create a pair when BOTH identifiers are present.
+        if ra_key and fmea_key:
+            existing_pairs.add((ra_key, fmea_key))
+
+    return existing_pairs
+
+
 
 
 def normalize_edo_record(edo_record):
@@ -2747,85 +2933,191 @@ def merge_new_edo_dictionary_full(
     return merged
 
 
+
 def merge_new_edo_records(new_records, existing_edos):
     """
-    CANONICAL new-EDO merge - used by generate_edo_template(), replacing
-    the old 4-source merge_new_edo_dictionary_full() now that
-    extract_new_edo_tags() has been removed and extract_new_edo_summary_details()
-    returns complete records directly from the single merged "EDO_NEW_details"
-    prompt.
+    CANONICAL new-EDO merge.
 
-    Fixes the "column mapped wrongly" bug: the previous merge logic looked
-    for keys like "Description_2" / "Reason_2" that never actually existed
-    in the LLM's JSON output - the real keys are "EDO_Description" and
-    "Reason_Identified_as_EDO_ColH". This function maps directly off the
-    ACTUAL field names the prompt returns:
+    A New EDO is considered a duplicate ONLY when BOTH:
+        1. RA Number matches an Existing EDO
+        2. FMEA Number matches the SAME Existing EDO
 
-        edo_description   <- Product_Feature_Function
-        reason_identified <- Reason_Identified_as_EDO
-        dfmea             <- Traceability
-        verification_reference <- Verification_Reference
-        location          <- EDO_Location
-        description_2     <- EDO_Description
-        reason_2          <- Reason_Identified_as_EDO_ColH
-        sysdd             <- fixed constant (get_fixed_sysdd_reference())
+    Examples:
+        Existing: RA-180 + FMEA Sys-147
 
-    Also applies requirement #2: any new record whose RA Number or FMEA
-    Number already belongs to an Existing EDO is dropped from the output,
-    so the same issue is never printed twice under both types.
+        New: RA-180 + FMEA Sys-147
+            -> REMOVE (duplicate)
 
-    Column A (edo_tag) is always the fixed literal "EDO-XX\\nNew" - the
-    risk Status is never printed there.
+        New: RA-180 + FMEA Sys-999
+            -> KEEP
+
+        New: RA-999 + FMEA Sys-147
+            -> KEEP
     """
+
     logging.info("=" * 80)
-    logging.info("STAGE 5: NEW EDO MERGE (SINGLE-PASS RECORDS, DE-DUPED AGAINST EXISTING)")
+    logging.info(
+        "STAGE 5: NEW EDO MERGE "
+        "(DE-DUPED AGAINST EXISTING BY RA + FMEA PAIR)"
+    )
     logging.info("=" * 80)
 
-    existing_identifiers = get_existing_identifier_set(existing_edos)
+    existing_pairs = get_existing_identifier_pairs(existing_edos)
+
+    logging.info(
+        "Existing EDO RA/FMEA pairs: %s",
+        sorted(existing_pairs)
+    )
 
     records = deep_extract_records(new_records)
     merged = {}
+    seen_new_pairs = set()
 
     for index, row in enumerate(records):
         if not isinstance(row, dict):
             continue
 
-        ra_number = normalize_text(get_llm_value(row, "RA_Number", "RA Number"))
-        fmea_number = normalize_text(get_llm_value(row, "FMEA_Number", "FMEA Number"))
-
-        # Requirement #2: skip any new record already tracked as an
-        # Existing EDO (same RA id or FMEA id), so it isn't duplicated.
-        ra_key = ra_number.upper()
-        fmea_key = fmea_number.upper()
-        if (ra_key and ra_key in existing_identifiers) and (fmea_key and fmea_key in existing_identifiers):
+        # Defense in depth: merge only New EDO records explicitly
+        # classified as Medium. Existing EDOs are handled separately by
+        # merge_all_edos() and are never evaluated by this condition.
+        risk_status = normalize_text(
+            get_llm_value(
+                row,
+                "Risk_Status",
+                "Risk Status",
+                "risk_status",
+                "RiskStatus",
+            )
+        )
+        if risk_status.casefold() != "medium":
             logging.info(
-                f"Skipping New EDO record RA={ra_number!r} FMEA={fmea_number!r} - "
-                f"already tracked as an Existing EDO."
+                "Skipping New EDO during merge because Risk_Status=%r; "
+                "only Medium records are eligible.",
+                risk_status,
             )
             continue
 
+        ra_number = normalize_text(
+            get_llm_value(row, "RA_Number", "RA Number")
+        )
+
+        fmea_number = normalize_text(
+            get_llm_value(row, "FMEA_Number", "FMEA Number")
+        )
+
+        # Canonicalize formatting variants such as ``SYS-734`` and
+        # ``FMEA Sys-734`` before comparing the pair.
+        ra_key = canonical_ra_id(ra_number)
+        fmea_key = canonical_fmea_id(fmea_number)
+
+        current_pair = (ra_key, fmea_key)
+
+        # ---------------------------------------------------------
+        # Requirement:
+        # Remove ONLY when BOTH RA and FMEA match an existing
+        # EDO pair.
+        # ---------------------------------------------------------
+        if (
+            ra_key
+            and fmea_key
+            and current_pair in existing_pairs
+        ):
+            logging.info(
+                "Skipping duplicate New EDO: "
+                "RA=%r FMEA=%r - exact RA/FMEA pair already "
+                "exists in Existing EDO.",
+                ra_number,
+                fmea_number,
+            )
+            continue
+
+        if ra_key and fmea_key:
+            if current_pair in seen_new_pairs:
+                logging.info(
+                    "Skipping repeated New EDO: RA=%r FMEA=%r - canonical "
+                    "pair %r was already emitted in this run.",
+                    ra_number,
+                    fmea_number,
+                    current_pair,
+                )
+                continue
+            seen_new_pairs.add(current_pair)
+
         key = fmea_number or ra_number or f"NEW-EDO-RECORD-{index}"
+
         if key in merged:
             key = f"{key}_{index}"
 
         merged[key] = {
             "edo_type": "New",
-            # Per requirement: Column A never prints the risk Status -
-            # always the fixed literal tag text, correctly cased.
+
+            # Column A always uses fixed literal.
             "edo_tag": "EDO-XX\nNew",
-            "edo_description": normalize_text(get_llm_value(row, "Product_Feature_Function", "Product Feature Function")),
-            "reason_identified": normalize_text(get_llm_value(row, "Reason_Identified_as_EDO", "Reason Identified as EDO")),
-            "dfmea": normalize_text(get_llm_value(row, "Traceability", "traceability")),
-            "verification_reference": normalize_text(get_llm_value(row, "Verification_Reference", "Verification Reference")),
-            "location": normalize_text(get_llm_value(row, "EDO_Location", "location")),
-            "description_2": normalize_text(get_llm_value(row, "EDO_Description", "description")),
-            "reason_2": normalize_text(get_llm_value(row, "Reason_Identified_as_EDO_ColH", "reason_2")),
+
+            "edo_description": normalize_text(
+                get_llm_value(
+                    row,
+                    "Product_Feature_Function",
+                    "Product Feature Function"
+                )
+            ),
+
+            "reason_identified": normalize_text(
+                get_llm_value(
+                    row,
+                    "Reason_Identified_as_EDO",
+                    "Reason Identified as EDO"
+                )
+            ),
+
+            "dfmea": normalize_text(
+                get_llm_value(
+                    row,
+                    "Traceability",
+                    "traceability"
+                )
+            ),
+
+            "verification_reference": normalize_text(
+                get_llm_value(
+                    row,
+                    "Verification_Reference",
+                    "Verification Reference"
+                )
+            ),
+
+            "location": normalize_text(
+                get_llm_value(
+                    row,
+                    "EDO_Location",
+                    "location"
+                )
+            ),
+
+            "description_2": normalize_text(
+                get_llm_value(
+                    row,
+                    "EDO_Description",
+                    "description"
+                )
+            ),
+
+            "reason_2": normalize_text(
+                get_llm_value(
+                    row,
+                    "Reason_Identified_as_EDO_ColH",
+                    "reason_2"
+                )
+            ),
+
             "sysdd": get_fixed_sysdd_reference(),
+
             "RA_Number": ra_number,
-            "FMEA_Number": fmea_number
+            "FMEA_Number": fmea_number,
         }
 
     return merged
+
 
 
 def merge_existing_edo_dictionary(existing_details):
@@ -3152,19 +3444,20 @@ def extract_and_apply_verification_details(
         # "\nTARGETS:\n" + target_text - this one alone omitted it).
         if ra_only:
             target_text = f"RA_Number : {ra_number}"
-            verification_question = f"Fetch verification records for {ra_number}"
+            verification_question = f"Fetch risk controls values for {ra_number}"
         else:
             target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
-            verification_question = f"Fetch verification records for {fmea_number} and {ra_number}"
+            verification_question = f"Fetch risk controls values for {fmea_number} and {ra_number}"
 
         prompt_row = {
             "prompt_role": prompt_data["prompt_role"],
             "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
             "question": verification_question,
-            "fulltext": "No",
+            "fulltext": "Yes",
             "where_filter": "",
             "where_document": "",
-            "checkpoint": f"Fetch verification records for {fmea_number} and {ra_number}"
+            "checkpoint": f"Fetch risk controls values for {fmea_number} and {ra_number}",
+            "max_results": 25
         }
 
         try:
@@ -3331,338 +3624,291 @@ def get_llm_value(row, *keys):
 
 
 
+def _strip_wrapping_quotes_and_brackets(token: str) -> str:
+    """
+    Strips any stray outer bracket/paren and quote characters left behind
+    on a single code token, e.g. "['DRS-570'" -> "DRS-570",
+    "'SRS-CTRL-51']" -> "SRS-CTRL-51", '"DRS-570"' -> 'DRS-570'.
+    Runs repeatedly since a token can carry more than one such layer
+    (e.g. a leading "[" AND a leading "'" at once).
+    """
+    token = token.strip()
+    prev = None
+    while token and token != prev:
+        prev = token
+        token = token.strip()
+        # Strip one layer of matching/loose brackets or parens on either side.
+        if token[:1] in "([" :
+            token = token[1:]
+        if token[-1:] in ")]":
+            token = token[:-1]
+        # Strip one layer of quote marks on either side (they don't need
+        # to match each other - malformed input can leave just one side).
+        if token[:1] in "'\"":
+            token = token[1:]
+        if token[-1:] in "'\"":
+            token = token[:-1]
+        token = token.strip()
+    return token
+
+
 def parse_verification_codes(verification_ref_str: str) -> List[str]:
     """
-    Parses a verification string into a clean list of individual code strings.
-    Example input: '(DRS-570, MS CU Mod-384, SRS-CTRL-39)'
-    Example output: ['DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39']
+    Parses a verification string into a clean list of individual code strings,
+    regardless of which format CALL 6 happened to emit it in. Handles:
+      - Plain parens:            '(DRS-570, MS CU Mod-384, SRS-CTRL-39)'
+      - Plain comma list:        'DRS-570, MS CU Mod-384, SRS-CTRL-39'
+      - Python list repr (str):  "['DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39']"
+      - Python tuple repr (str): "('DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39')"
+    In every case the output is the same clean list:
+      ['DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39']
     """
     if not verification_ref_str:
         return []
-    
+
+    # Already an actual list/tuple (not a string) - just clean each element.
+    if isinstance(verification_ref_str, (list, tuple, set)):
+        return [
+            _strip_wrapping_quotes_and_brackets(str(c))
+            for c in verification_ref_str
+            if str(c).strip()
+        ]
+
     raw_str = str(verification_ref_str).strip()
-    if raw_str.startswith("(") and raw_str.endswith(")"):
+    if not raw_str:
+        return []
+
+    # If this is a stringified Python list/tuple (e.g. "['DRS-570', 'MS CU Mod-97']"),
+    # parse it properly instead of naively splitting on commas - a naive split
+    # leaves brackets/quotes stuck onto the first and last codes, which then
+    # fail every prefix match in resolve_traceability_reference().
+    if (raw_str.startswith("[") and raw_str.endswith("]")) or \
+       (raw_str.startswith("(") and raw_str.endswith(")")):
+        try:
+            parsed = ast.literal_eval(raw_str)
+            if isinstance(parsed, (list, tuple, set)):
+                return [
+                    _strip_wrapping_quotes_and_brackets(str(c))
+                    for c in parsed
+                    if str(c).strip()
+                ]
+        except (ValueError, SyntaxError):
+            # Not valid Python literal syntax - fall through to manual
+            # stripping below rather than failing outright.
+            pass
         raw_str = raw_str[1:-1]
-        
-    codes = [code.strip() for code in raw_str.split(",") if code.strip()]
-    return codes
+
+    codes = [
+        _strip_wrapping_quotes_and_brackets(code)
+        for code in raw_str.split(",")
+        if code.strip()
+    ]
+    return [code for code in codes if code]
 
 
-# Canonical field name -> accepted spellings the raw LLM extraction might use.
-# Used to normalize every record down to exactly the 4 columns we care about
-# (REQ TAG / V/V RECORD FILE NAME / V/V RECORD LOCATION / REQ RESULT) before
-# it's stored in EXCEL_TM_1_Details..EXCEL_TM_4_Details, instead of storing
-# whatever raw/extra keys the LLM happened to return.
-_EXCEL_FIELD_KEY_CANDIDATES = {
-    "req_tag": ["req_tag", "Req_Tag", "REQ_TAG", "reqtag", "Req Tag", "REQ TAG"],
-    "vv_record_file_name": [
-        "vv_record_file_name", "VV_Record_File_Name", "vv_record_filename",
-        "V/V Record File Name", "V/V RECORD FILE NAME", "vv_file_name"
-    ],
-    "vv_record_location": [
-        "vv_record_location", "VV_Record_Location",
-        "V/V Record Location", "V/V RECORD LOCATION"
-    ],
-    "req_result": [
-        "req_result", "Req_Result", "REQ_RESULT",
-        "Req Result", "REQ RESULT", "pass/fail", "Pass/Fail"
-    ],
+
+# ==========================================================
+# CALL 7: TRACEABILITY REFERENCE RESOLUTION (per verification code)
+# ==========================================================
+# Each verification code produced by CALL 6 (e.g. "DRS-570",
+# "SRS-CTRL-39", "MS ACC Mod-112", "MS CU Mod-384") belongs to exactly
+# ONE of 4 fixed traceability spreadsheets, selected purely by the
+# code's own tag prefix - never by document order/position:
+#
+#   SRS-CTRL-###   tag -> EDO_TM_1 -> SW V&V Traceability Spreadsheet.xlsx
+#   MS ACC Mod-### tag -> EDO_TM_2 -> Vest APX GHA Verification Traceability Spreadsheet Rev 4.xlsx
+#   DRS-###        tag -> EDO_TM_3 -> Vest APX System Verification Traceability Spreadsheet Rev 9 (2).xlsx
+#   MS CU Mod-###  tag -> EDO_TM_4 -> Vest APX Control Unit Module Verification Traceability Spreadsheet Rev
+#
+# Order matters below: more specific prefixes ("MS CU Mod", "MS ACC Mod")
+# must be checked before anything shorter/ambiguous.
+TRACEABILITY_TAG_MAP = [
+    ("SRS-CTRL", "EDO_TM_1", "SW V&V Traceability Spreadsheet.xlsx"),
+    ("MS ACC Mod", "EDO_TM_2", "Vest APX GHA Verification Traceability Spreadsheet Rev 4.xlsx"),
+    ("MS CU Mod", "EDO_TM_4", "Vest APX Control Unit Module Verification Traceability Spreadsheet Rev"),
+    ("DRS", "EDO_TM_3", "Vest APX System Verification Traceability Spreadsheet Rev 9 (2).xlsx"),
+]
+
+
+def resolve_traceability_reference(code: str):
+    """
+    STEP 1 of CALL 7 - decides which of the 4 fixed traceability
+    spreadsheets a single verification code belongs to, purely by
+    matching the code's own tag prefix against TRACEABILITY_TAG_MAP.
+    No LLM/DB call is made here.
+
+    Returns {"identifier": "EDO_TM_3", "document_name": "...", "code": code}
+    or None when the code doesn't match any known tag.
+    """
+    if not code:
+        return None
+
+    # Defense-in-depth: even though parse_verification_codes() should already
+    # hand us clean codes, strip any stray quotes/brackets here too so a code
+    # like "['DRS-570'" (or one passed in directly by a future caller) still
+    # resolves instead of silently falling through to "NO TAG MATCH".
+    clean_code = _strip_wrapping_quotes_and_brackets(str(code).strip())
+    normalized = re.sub(r'[\s_-]+', ' ', clean_code).upper()
+
+    for prefix, identifier, document_name in TRACEABILITY_TAG_MAP:
+        prefix_norm = re.sub(r'[\s_-]+', ' ', prefix).upper()
+        if normalized.startswith(prefix_norm):
+            return {
+                "identifier": identifier,
+                "document_name": document_name,
+                "code": code,
+            }
+    return None
+
+
+def _get_traceability_collection(edo_document, identifier):
+    """
+    Finds the Excel document/collection configured for a given
+    traceability identifier (EDO_TM_1..EDO_TM_4). Matches first by the
+    document's own document_identity/document_name against the
+    identifier (e.g. "edo_tm_1") or its known filename, falling back to
+    positional excel_documents order only when no direct name match is
+    found. Returns (collection, document_name) or (None, None).
+    """
+    excel_documents = edo_document.get("excel_documents", [])
+    identifier_norm = normalize_text(identifier).lower()
+
+    for doc in excel_documents:
+        identity = normalize_text(doc.get("document_identity")).lower()
+        name = normalize_text(doc.get("document_name")).lower()
+        if identifier_norm and (identifier_norm in identity or identifier_norm.replace("_", "") in identity.replace("_", "")):
+            return doc.get("collection"), doc.get("document_name")
+        for _, mapped_identifier, mapped_name in TRACEABILITY_TAG_MAP:
+            if mapped_identifier == identifier and mapped_name and name and (
+                mapped_name.lower() in name or name in mapped_name.lower()
+            ):
+                return doc.get("collection"), doc.get("document_name")
+
+    # Fallback: positional mapping (1st excel doc -> EDO_TM_1, etc.)
+    index_map = {"EDO_TM_1": 0, "EDO_TM_2": 1, "EDO_TM_3": 2, "EDO_TM_4": 3}
+    idx = index_map.get(identifier)
+    if idx is not None and idx < len(excel_documents):
+        doc = excel_documents[idx]
+        return doc.get("collection"), doc.get("document_name")
+
+    return None, None
+
+
+def _query_traceability_details(pipeline_config, collection, prompt_data, code):
+    """
+    STEP 2 of CALL 7 - shared single-code LLM query used by all four
+    extract_edo_tm_X_details() functions below. Always targets exactly
+    ONE verification code with a full document search disabled
+    (fulltext = "No"), since the code itself is specific enough to
+    locate the right row(s) without scanning the entire spreadsheet.
+    """
+    question = f"Extract the {code} details"
+
+    prompt_row = {
+        "prompt_role": prompt_data["prompt_role"],
+        "prompt_text": prompt_data["prompt_text"],
+        "question": question,
+        "fulltext": "Yes",
+        "where_filter": "",
+        "where_document": "",
+        "checkpoint": question,
+        "max_results": 25
+    }
+
+    try:
+        _, _, response = execute_llm_retry(pipeline_config, collection, prompt_row)
+    except Exception as e:
+        logging.error(f"CALL 7: traceability LLM call failed for code {code!r}: {e}")
+        return {}
+
+    parsed = parse_json(response)
+    records = deep_extract_records(parsed)
+    row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+    return row if isinstance(row, dict) else {}
+
+
+def extract_edo_tm_1_details(pipeline_config, collection, code, prompt_data):
+    """SRS-CTRL-### codes -> EDO_TM_1 (SW V&V Traceability Spreadsheet.xlsx)."""
+    return _query_traceability_details(pipeline_config, collection, prompt_data, code)
+
+
+def extract_edo_tm_2_details(pipeline_config, collection, code, prompt_data):
+    """MS ACC Mod-### codes -> EDO_TM_2 (Vest APX GHA Verification Traceability Spreadsheet Rev 4.xlsx)."""
+    return _query_traceability_details(pipeline_config, collection, prompt_data, code)
+
+
+def extract_edo_tm_3_details(pipeline_config, collection, code, prompt_data):
+    """DRS-### codes -> EDO_TM_3 (Vest APX System Verification Traceability Spreadsheet Rev 9 (2).xlsx)."""
+    return _query_traceability_details(pipeline_config, collection, prompt_data, code)
+
+
+def extract_edo_tm_4_details(pipeline_config, collection, code, prompt_data):
+    """MS CU Mod-### codes -> EDO_TM_4 (Vest APX Control Unit Module Verification Traceability Spreadsheet)."""
+    return _query_traceability_details(pipeline_config, collection, prompt_data, code)
+
+
+TRACEABILITY_EXTRACTOR_BY_IDENTIFIER = {
+    "EDO_TM_1": extract_edo_tm_1_details,
+    "EDO_TM_2": extract_edo_tm_2_details,
+    "EDO_TM_3": extract_edo_tm_3_details,
+    "EDO_TM_4": extract_edo_tm_4_details,
 }
 
 
-def _normalize_excel_record(record: dict, source_filename: str) -> dict:
-    """
-    Reduces a raw extracted record down to exactly the 4 canonical fields
-    (req_tag, vv_record_file_name, vv_record_location, req_result) plus
-    _source_filename - regardless of what key spelling the LLM extraction
-    returned. This is what actually gets stored in EXCEL_TM_1_Details..
-    EXCEL_TM_4_Details, so downstream lookups can always rely on these exact
-    keys being present.
-    """
-    clean = {}
-    for canonical_key, candidates in _EXCEL_FIELD_KEY_CANDIDATES.items():
-        value = None
-        for candidate in candidates:
-            v = record.get(candidate)
-            if v not in (None, "", "Blank"):
-                value = v
-                break
-        clean[canonical_key] = value if value is not None else ""
-
-    clean["_source_filename"] = source_filename
-    return clean
-
-
-# Safety cap on how many continuation batches to request per document before
-# giving up - prevents an infinite loop if the LLM keeps claiming there's
-# more data that never actually arrives. 15 batches is generous headroom for
-# even a very large sheet/log file extracted a few hundred rows at a time.
-MAX_EXCEL_EXTRACTION_BATCHES = 40
-
-
-def extract_full_collection_records(
-    pipeline_config: dict,
-    collection,
-    prompt_data: dict,
-    filename: str,
-    target_list_key: str
+def build_final_edos_with_traceability(
+    client,
+    product_family,
+    product,
+    templatename,
+    pipeline_config,
+    edo_document,
+    merged_edos: Dict[str, dict],
+    db
 ) -> List[dict]:
     """
-    Extracts ALL rows out of a document collection regardless of how large
-    it is, by looping the LLM call instead of relying on a single call to
-    fit the entire document under max_tokens. Every batch after the first
-    explicitly asks the model to continue from the last req_tag it gave us
-    and to return an empty array once nothing is left - so document context
-    is never silently dropped just because one response got truncated.
+    CALL 7: Traceability Reference Resolution.
 
-    Records are normalized (see _normalize_excel_record) and deduplicated
-    by (req_tag, vv_record_location) as they come in, so a batch that
-    re-sends a row already captured doesn't create a duplicate entry.
-    """
-    all_records: List[dict] = []
-    seen_keys = set()
-    last_req_tag = None
+    For every merged EDO record, parses its verification_reference
+    string (written by CALL 6) into individual codes (e.g. 'DRS-570',
+    'MS CU Mod-384', 'SRS-CTRL-39', 'MS ACC Mod-112') and resolves EACH
+    code with a single, targeted LLM call against exactly the one
+    traceability spreadsheet its tag belongs to - decided up front by
+    resolve_traceability_reference() (pure string match, no LLM/DB
+    call), then fetched by the matching extract_edo_tm_X_details()
+    function via a single "Extract the {code} details" query with a
+    full document search disabled.
 
-    for batch_num in range(1, MAX_EXCEL_EXTRACTION_BATCHES + 1):
-        if last_req_tag is None:
-            question = (
-                "Extract ALL rows in this document that contain a requirement/"
-                "verification code, starting from the very first row. Follow the "
-                "field definitions and output format exactly."
-            )
-        else:
-            question = (
-                f"You are continuing a previous extraction of this SAME document. "
-                f"The last row already extracted had req_tag '{last_req_tag}'. "
-                f"Continue reading the document from immediately AFTER that row and "
-                f"extract every remaining row that has not already been given - do "
-                f"NOT repeat any row already extracted. Use the exact same JSON "
-                f"field format. If there are no rows left in the document, return "
-                f"exactly this empty JSON array: []"
-            )
-
-        prompt_row = {
-            "prompt_role": prompt_data["prompt_role"],
-            "prompt_text": prompt_data["prompt_text"],
-            "question": question,
-            "fulltext": "Yes",
-            "where_filter": "",
-            "where_document": "",
-            "checkpoint": f"Extracting {target_list_key} - batch {batch_num}",
-            # Explicitly request a high retrieval ceiling. Without this,
-            # retrieve_content_for_prompt() may fall back to an internal
-            # default max_results that caps how much of the document is
-            # actually fed to the LLM as context - independent of, and
-            # happening BEFORE, the generation-side max_tokens limit. If the
-            # document has 400+ rows but every batch keeps seeing the same
-            # ~54, this retrieval-side cap (not the model deciding it's
-            # done) is the most likely cause.
-            "max_results": 5000
-        }
-
-        try:
-            docs, metadata, response = execute_llm_retry(pipeline_config, collection, prompt_row)
-
-            # Diagnostic: how much source content actually reached the LLM
-            # this batch. If this count/size is identical across batches
-            # despite the "continue after X" instruction, retrieval is
-            # feeding the same fixed window every time rather than the
-            # continuation prompt having any effect - confirms a
-            # retrieval-side cap rather than a generation-side one.
-            try:
-                doc_count = len(docs) if docs is not None else 0
-                doc_chars = sum(len(str(d)) for d in docs) if docs else 0
-                logging.info(
-                    f"{target_list_key} batch {batch_num} - retrieved {doc_count} "
-                    f"doc chunk(s), ~{doc_chars} total characters of source context"
-                )
-            except Exception:
-                pass
-
-            parsed = parse_json(response)
-            batch_records = deep_extract_records(parsed)
-
-            if not batch_records and isinstance(parsed, dict) and parsed:
-                batch_records = [parsed]
-
-        except Exception as ex:
-            logging.error(
-                f"Batch {batch_num} failed for {target_list_key} ('{filename}'): {ex}"
-            )
-            break
-
-        if not batch_records:
-            logging.info(
-                f"{target_list_key} ('{filename}') - batch {batch_num} returned no "
-                f"rows, extraction complete. Total collected: {len(all_records)}"
-            )
-            break
-
-        new_count = 0
-        for record in batch_records:
-            normalized = _normalize_excel_record(record, filename)
-            dedup_key = (normalized["req_tag"], normalized["vv_record_location"])
-            if dedup_key in seen_keys:
-                continue
-            seen_keys.add(dedup_key)
-            all_records.append(normalized)
-            new_count += 1
-
-        logging.info(
-            f"{target_list_key} ('{filename}') - batch {batch_num}: "
-            f"{len(batch_records)} rows returned, {new_count} new after dedup "
-            f"(running total: {len(all_records)})"
-        )
-
-        if new_count == 0:
-            # The model returned rows but every one was already captured -
-            # it's not making progress, so stop rather than looping forever.
-            logging.info(
-                f"{target_list_key} ('{filename}') - batch {batch_num} produced no "
-                f"new rows, stopping (likely reached the end)."
-            )
-            break
-
-        last_req_tag = all_records[-1]["req_tag"] or last_req_tag
-
-    return all_records
-
-
-def extract_excel_sheets_to_separate_lists(
-    client,
-    product_family: str,
-    product: str,
-    templatename: str,
-    pipeline_config: dict,
-    edo_document: dict,
-    db: Any
-) -> Dict[str, List[dict]]:
-    """
-    Queries the LLM/database once for each Excel spreadsheet document collection 
-    and stores results into distinct list variables.
+    The combined, human-readable trace text for all of a record's codes
+    is written back onto `verification_reference` (the same column
+    format_edo_worksheet() reads into the output Excel). The raw parsed
+    code list is also kept under `verification_reference_parsed`.
     """
     logging.info("=" * 80)
-    logging.info("STAGE 1: EXTRACTING EXCEL DETAILS INTO SEPARATE LISTS")
+    logging.info("CALL 7: TRACEABILITY REFERENCE RESOLUTION (PER VERIFICATION CODE)")
     logging.info("=" * 80)
 
-    excel_documents = edo_document.get("excel_documents", [])
-    
-    # Pre-allocate key list names dynamically
-    excel_lists = {
-        "EXCEL_TM_1_Details": [],
-        "EXCEL_TM_2_Details": [],
-        "EXCEL_TM_3_Details": [],
-        "EXCEL_TM_4_Details": []
-    }
+    if not merged_edos:
+        logging.info("No merged EDO records to resolve traceability for.")
+        return []
 
     try:
         prompt_data = get_prompt(
             client, product_family, product, templatename, "EDO_Excel_Extraction", db
         )
     except Exception as e:
-        logging.error(f"Failed to load extraction prompt: {e}")
-        return excel_lists
+        logging.error(f"CALL 7: failed to load traceability prompt: {e}")
+        return list(merged_edos.values())
 
-    list_keys = list(excel_lists.keys())
+    # Cache the resolved (collection, document_name) per identifier so
+    # excel_documents is only searched once per EDO_TM_x, not once per code.
+    collection_cache = {}
 
-    for idx, excel_doc in enumerate(excel_documents[:4]):
-        target_list_key = list_keys[idx]
-        collection = excel_doc.get("collection")
-        filename = excel_doc.get("document_identity", f"Excel_Doc_{idx+1}")
-
-        if not collection:
-            continue
-
-        logging.info(f"Querying Collection {idx+1} ({filename}) -> Target Variable: {target_list_key}")
-
-        try:
-            # Paginated extraction: loops the LLM call in batches, each one
-            # continuing from the last row already captured, instead of a
-            # single call that can silently truncate on a large document -
-            # see extract_full_collection_records() for the batching logic.
-            normalized_records = extract_full_collection_records(
-                pipeline_config,
-                collection,
-                prompt_data,
-                filename,
-                target_list_key
-            )
-
-            excel_lists[target_list_key] = normalized_records
-
-            if normalized_records:
-                logging.info(f"Successfully loaded {len(normalized_records)} items into {target_list_key}")
-            else:
-                logging.error(
-                    f"ZERO usable items loaded into {target_list_key} from '{filename}' - "
-                    f"the LLM response could not be parsed as JSON at all (see JSON Parse "
-                    f"Error / truncation warning above). Verification codes from this sheet "
-                    f"will legitimately show as 'No match found' until this extraction is re-run."
-                )
-
-        except Exception as ex:
-            logging.error(f"Failed to extract details for {target_list_key}: {ex}")
-
-    return excel_lists
-
-
-def build_final_edos_with_traceability(
-    merged_edos: Dict[str, dict],
-    excel_lists: Dict[str, List[dict]]
-) -> List[dict]:
-    """
-    For every merged EDO record, parses its verification_reference string into
-    individual codes (e.g. 'DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39') and
-    resolves EACH code ONE AT A TIME purely by searching the 4 already-loaded
-    Excel lists (EXCEL_TM_1_Details .. EXCEL_TM_4_Details) that were built once
-    in extract_excel_sheets_to_separate_lists(). No LLM/DB call is made here -
-    this stage is a pure in-memory lookup against those 4 lists.
-
-    For each code, whichever Excel list contains it contributes its filename,
-    location, and result text. Every code's outcome (match or no-match) is
-    logged individually together with the owning EDO's RA_Number/FMEA_Number
-    for identification/debugging purposes.
-
-    The combined, human-readable trace text for all of a record's codes is
-    written back onto `verification_reference` (the same column
-    format_edo_worksheet() reads into the output Excel), so the match results
-    actually show up in the generated workbook. The raw parsed code list is
-    also kept under `verification_reference_parsed` for anyone who needs the
-    individual codes rather than the formatted text.
-    """
-    logging.info("=" * 80)
-    logging.info("STAGE 2: MATCHING TRACEABILITY CODES ACROSS EXCEL LISTS (LOCAL LOOKUP ONLY - NO LLM CALLS)")
-    logging.info("=" * 80)
+    def _collection_for(identifier):
+        if identifier not in collection_cache:
+            collection_cache[identifier] = _get_traceability_collection(edo_document, identifier)
+        return collection_cache[identifier]
 
     final_edos = []
-
-    # Explicit field names for each of the 4 fixed columns coming out of the
-    # Excel/log extraction (see logs.txt): REQ TAG (Col A), V/V RECORD FILE
-    # NAME (Col C), V/V RECORD LOCATION (Col D), REQ RESULT / PASS-FAIL (Col E).
-    # A short list of accepted key spellings is kept per field only to absorb
-    # harmless casing/underscore variance from the LLM extraction step - the
-    # match itself is always done against req_tag specifically, never a
-    # blind substring-of-the-whole-record search.
-    REQ_TAG_KEYS = ["req_tag", "Req_Tag", "REQ_TAG", "reqtag"]
-    VV_FILE_NAME_KEYS = ["vv_record_file_name", "VV_Record_File_Name", "vv_record_filename"]
-    VV_LOCATION_KEYS = ["vv_record_location", "VV_Record_Location"]
-    REQ_RESULT_KEYS = ["req_result", "Req_Result", "REQ_RESULT"]
-
-    def _first(item: dict, *keys):
-        """Return the first non-empty value found in `item` for any of `keys`."""
-        for k in keys:
-            val = item.get(k)
-            if val not in (None, "", "Blank"):
-                return val
-        return None
-
-    def _normalize_code(value) -> str:
-        """Normalizes a code/req_tag for comparison: uppercase, strip all
-        non-alphanumeric separators, so 'DRS-570', 'drs 570', 'DRS570' all
-        compare equal regardless of dash/space/case differences."""
-        if value is None:
-            return ""
-        return re.sub(r'[^A-Za-z0-9]', '', str(value)).upper()
 
     for key, edo_record in merged_edos.items():
         # Create a copy to prevent mutation issues
@@ -3675,6 +3921,11 @@ def build_final_edos_with_traceability(
         parsed_codes = parse_verification_codes(ver_ref_str)
 
         matched_trace_details = []
+        # Column M ("Remarks and Recommendation") needs a called-out remark
+        # for every verification code whose traceability call comes back
+        # with a Fail result - collected here and merged into the record
+        # below, then picked up by generate_remarks_and_recommendation().
+        fail_remarks = []
 
         logging.info("-" * 80)
         logging.info(
@@ -3683,42 +3934,68 @@ def build_final_edos_with_traceability(
         )
 
         for code in parsed_codes:
-            code_matched = False
-            normalized_code = _normalize_code(code)
+            resolved = resolve_traceability_reference(code)
 
-            # Walk each of the 4 lists individually (EXCEL_TM_1..4_Details) so the
-            # source list name is known for logging - still zero LLM/DB calls.
-            for list_name, excel_items in excel_lists.items():
-                for excel_item in excel_items:
-                    req_tag_value = _first(excel_item, *REQ_TAG_KEYS)
-                    if req_tag_value is None:
-                        continue
-                    if _normalize_code(req_tag_value) != normalized_code:
-                        continue
+            if not resolved:
+                matched_trace_details.append(f"{code} - Unrecognized tag, no traceability document mapped")
+                logging.info(
+                    f"  NO TAG MATCH | Code: {code} - does not match any known "
+                    "traceability tag prefix (DRS / MS CU Mod / MS ACC Mod / SRS-CTRL)"
+                )
+                continue
 
-                    code_matched = True
-                    filename = _first(excel_item, *VV_FILE_NAME_KEYS) \
-                        or excel_item.get("_source_filename", "Unknown File")
-                    location = _first(excel_item, *VV_LOCATION_KEYS) or "N/A"
-                    result_text = _first(excel_item, *REQ_RESULT_KEYS) or "N/A"
+            identifier = resolved["identifier"]
+            collection, source_document_name = _collection_for(identifier)
 
-                    # Final output format the user wants in the Excel cell:
-                    # "<Req_Tag> <V/V RECORD LOCATION> - <V/V RECORD FILE NAME>"
-                    trace_entry = f"{req_tag_value} {location} - {filename}"
-                    matched_trace_details.append(trace_entry)
+            if not collection:
+                matched_trace_details.append(f"{code} - {identifier} document not configured")
+                logging.info(
+                    f"  NO DOCUMENT | Code: {code} | Identifier: {identifier} - "
+                    "collection not found among configured Excel documents"
+                )
+                continue
 
-                    logging.info(
-                        f"  MATCH    | List: {list_name} | Code: {code} | "
-                        f"RA_Number: {ra_number!r} | FMEA_Number: {fmea_number!r} | "
-                        f"req_tag: {req_tag_value} | File: {filename} | "
-                        f"Location: {location} | Result: {result_text}"
-                    )
+            extractor = TRACEABILITY_EXTRACTOR_BY_IDENTIFIER[identifier]
+            row = extractor(pipeline_config, collection, code, prompt_data)
 
-            if not code_matched:
+            if not row:
                 matched_trace_details.append(f"{code} - No match found")
                 logging.info(
-                    f"  NO MATCH | Code: {code} | RA_Number: {ra_number!r} | "
-                    f"FMEA_Number: {fmea_number!r} - not found in any of the 4 Excel lists"
+                    f"  NO MATCH | Code: {code} | Identifier: {identifier} - "
+                    "LLM returned no usable record"
+                )
+                continue
+
+            req_tag_value = get_llm_value(row, "req_tag", "Req_Tag", "REQ_TAG") or code
+            filename = get_llm_value(row, "vv_record_file_name", "VV_Record_File_Name") \
+                or source_document_name or "Unknown File"
+            location = get_llm_value(row, "vv_record_location", "VV_Record_Location") or "N/A"
+            result_text = get_llm_value(row, "req_result", "Req_Result", "REQ_RESULT") or "N/A"
+
+            # Final output format the user wants in the Excel cell:
+            # "<Req_Tag> <V/V RECORD LOCATION> - <V/V RECORD FILE NAME>"
+            trace_entry = f"{req_tag_value} {location} - {filename}"
+            matched_trace_details.append(trace_entry)
+
+            logging.info(
+                f"  MATCH    | Identifier: {identifier} | Code: {code} | "
+                f"RA_Number: {ra_number!r} | FMEA_Number: {fmea_number!r} | "
+                f"req_tag: {req_tag_value} | File: {filename} | "
+                f"Location: {location} | Result: {result_text}"
+            )
+
+            # If this code's traceability test result comes back Fail, flag it
+            # for Column M with a dedicated remark - independent of whether a
+            # matching row was otherwise found.
+            if normalize_text(result_text).strip().lower() == "fail" or "fail" in normalize_text(result_text).strip().lower():
+                fail_remark = (
+                    f'The following "{code}" test report is not identified and not '
+                    "verified in any of the traceability spreadsheets or records."
+                )
+                fail_remarks.append(fail_remark)
+                logging.info(
+                    f"  RESULT FAIL | Identifier: {identifier} | Code: {code} - "
+                    f"flagged for Column M remark: {fail_remark!r}"
                 )
 
         # Assign the resolved trace text back onto verification_reference itself -
@@ -3726,6 +4003,9 @@ def build_final_edos_with_traceability(
         # so the resolved location/filename/result now actually reach the sheet.
         final_record["verification_reference_parsed"] = parsed_codes
         final_record["verification_reference"] = "\n".join(matched_trace_details)
+        # Picked up by generate_remarks_and_recommendation() below and
+        # rendered into Column M ("Remarks and Recommendation").
+        final_record["traceability_fail_remarks"] = fail_remarks
 
         final_edos.append(final_record)
 
@@ -3736,79 +4016,7 @@ def build_final_edos_with_traceability(
 # ==========================================================
 # COMMON PROCESSING PIPELINE
 # ==========================================================
-# CALL 7: Traceability, Risk Classification, Remarks and Recommendation - executed once per merged record, shared between Existing and New EDOs (see format_edo_worksheet in EXCEL FORMATTING).
-
-TRACE_CODE_PATTERNS = [
-    r'DRS[-\s]*\d+',
-    r'MS\s*CU\s*Mod[-\s]*\d+',
-    r'MS\s*ACC\s*Mod[-\s]*\d+',
-    r'SRS-CTRL[-\s]*\d+',
-    r'MRS\s*CU\s*FMEA[-\s]*\S+',
-    r'MRS\s*Software\s*FMEA[-\s]*\S+',
-    r'MRS\s*ACC\s*FMEA[-\s]*\S+',
-    r'RRAA[-\s]?\S*',
-    r'RA[-\s]*\d+',
-    r'FMEA\s*Sys[-\s]*\d+',
-]
-TRACE_KEY_TYPE_MAP = [
-    (["mscumod"], "MS CU Mod"),
-    (["msaccmod"], "MS ACC Mod"),
-    (["srsctrl"], "SRS-CTRL"),
-    (["mrscufmea"], "MRS CU FMEA"),
-    (["mrssoftwarefmea"], "MRS Software FMEA"),
-    (["mrsaccfmea"], "MRS ACC FMEA"),
-    (["rraa"], "RRAA"),
-    (["drs"], "DRS"),
-]
-
-def _find_trace_code(value):
-    """Returns the first recognizable code (DRS 570, MS CU Mod 448,
-    SRS-CTRL 39, MRS ACC FMEA-380, RRAA, RA-141, FMEA Sys-152, ...)
-    found inside `value`, or "" if none. Accepts either "DRS-570" or
-    "DRS 570" in the source text and normalizes the separator between
-    the prefix and the number to a single space, so the output is
-    always e.g. "DRS 570" - never just the bare "570". The code itself
-    already shows which type/state it is - no extra label needed."""
-    text = normalize_text(value)
-    if not text:
-        return ""
-    for pattern in TRACE_CODE_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            code = re.sub(r'[-\s]+', ' ', match.group(0)).strip()
-            return code
-    return ""
-
-
-def _find_typed_trace_number(record):
-    """Walks a (possibly nested) record looking for a trace code. Unlike
-    _find_trace_code(), this also catches a BARE number that has no
-    prefix of its own in the text (e.g. {"DRS": 570} or
-    {"DRS_Number": "570"}) and prefixes it with the type implied by ITS
-    OWN KEY (via TRACE_KEY_TYPE_MAP) - so the result is "DRS 570", never
-    a naked "570" that doesn't say what it is."""
-    if isinstance(record, dict):
-        for k, v in record.items():
-            if isinstance(v, (str, int, float)):
-                text = normalize_text(v)
-                code = _find_trace_code(text)
-                if code:
-                    return code
-                if re.fullmatch(r'\d+', text):
-                    key_norm = re.sub(r'[^a-z]', '', str(k).lower())
-                    for tokens, label in TRACE_KEY_TYPE_MAP:
-                        if any(t in key_norm for t in tokens):
-                            return f"{label} {text}"
-            else:
-                found = _find_typed_trace_number(v)
-                if found:
-                    return found
-    elif isinstance(record, list):
-        for item in record:
-            found = _find_typed_trace_number(item)
-            if found:
-                return found
-    return ""
+# Risk Classification, Remarks and Recommendation - executed once per merged record, shared between Existing and New EDOs (see format_edo_worksheet in EXCEL FORMATTING). Traceability reference resolution (CALL 7) now happens earlier, in build_final_edos_with_traceability() above.
 
 
 def _flatten_record_values(record):
@@ -3903,24 +4111,198 @@ def apply_risk_cell_style(cell, risk):
         cell.fill = PatternFill(fill_type=None)
 
 
-def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_config):
+def get_fmea_risk_evaluation(pipeline_config, edo_document, prompt_data, ra_number, fmea_number):
+    """
+    Looks up the Risk_Evaluation column value for a specific FMEA_Number
+    (paired with its RA_Number for targeting) directly from the
+    EDO_FMEA document/collection via one targeted LLM call. Returns the
+    normalized, lowercased value (e.g. "low", "medium", "high") or ""
+    when the FMEA document isn't configured, no row is found, or the
+    value can't be determined.
+
+    NOTE: The FMEA sheet has TWO separate "Risk Evaluation" columns -
+    one for "Risk Evaluation (Prior to Risk Control)" and another for
+    "Risk Evaluation (After Risk Control)". The Observation block must
+    only ever be driven off the PRIOR TO RISK CONTROL column, so both
+    the LLM question below and the key matching against the returned
+    row are scoped explicitly to that column - a bare "Risk_Evaluation"
+    match is deliberately NOT attempted, since that key is ambiguous
+    between the two columns and could silently resolve to the "After
+    Risk Control" value instead.
+    """
+    if not fmea_number or not edo_document or "edo_fmea" not in edo_document or not prompt_data:
+        return ""
+
+    target_text = f"RA_Number : {ra_number}\nFMEA_Number : {fmea_number}"
+
+    prompt_row = {
+        "prompt_role": prompt_data["prompt_role"],
+        "prompt_text": prompt_data["prompt_text"] + "\nTARGETS:\n" + target_text,
+        "question": (
+            f"Does a row for FMEA_Number {fmea_number} exist in this FMEA "
+            "document? This FMEA sheet has two separate Risk Evaluation "
+            "columns - 'Risk Evaluation (Prior to Risk Control)' and "
+            "'Risk Evaluation (After Risk Control)'. Return that row as a "
+            "single JSON object if it exists, including BOTH risk "
+            "evaluation values, clearly labeled as "
+            "'Risk_Evaluation_Prior_to_Risk_Control' and "
+            "'Risk_Evaluation_After_Risk_Control' respectively - do not "
+            "merge them into a single generic 'Risk_Evaluation' field."
+        ),
+        "fulltext": "Yes",
+        "where_filter": "",
+        "where_document": "",
+        "checkpoint": ""
+    }
+
+    try:
+        _, _, response = execute_llm_retry(
+            pipeline_config,
+            edo_document["edo_fmea"]["collection"],
+            prompt_row
+        )
+        parsed = parse_json(response)
+        records = deep_extract_records(parsed)
+        row = records[0] if records else (parsed if isinstance(parsed, dict) else {})
+    except Exception as e:
+        logging.error(f"OBSERVATION: Risk_Evaluation lookup failed for FMEA={fmea_number!r}: {e}")
+        return ""
+
+    # Only match keys that unambiguously refer to the "Prior to Risk
+    # Control" column. A generic "Risk_Evaluation"/"Risk Evaluation" key
+    # is intentionally excluded here since the FMEA sheet has a second,
+    # differently-scoped column whose name collides with it.
+    risk_evaluation_value = normalize_text(
+        get_llm_value(
+            row,
+            "Risk_Evaluation_Prior_to_Risk_Control",
+            "Risk Evaluation Prior to Risk Control",
+            "Risk Evaluation (Prior to Risk Control)",
+            "Risk_Evaluation_Prior",
+            "Prior to Risk Control",
+            "Risk_Rating_Prior_to_Risk_Control",
+            "Risk Rating (Prior to Risk Control)"
+        )
+    )
+    return risk_evaluation_value.strip().lower()
+
+
+def generate_observation_text(pipeline_config, edo_document, prompt_data, ra_number, fmea_number):
+    """
+    Column M "Observation" block.
+
+    Looks up the Sys-FMEA Risk_Evaluation value for this record's
+    FMEA_Number:
+      - "Low"    -> returns the fixed observation sentence below.
+      - "Medium" -> returns "" (no text, no heading printed at all).
+      - anything else (High/blank/not found) -> returns "" as well.
+    """
+    risk_evaluation = get_fmea_risk_evaluation(
+        pipeline_config, edo_document, prompt_data, ra_number, fmea_number
+    )
+
+    if risk_evaluation == "low":
+        return (
+            "Observation: In Sys-FMEA, the risk evaluation is 'Low'. "
+            "recommended to change in the sys-FMEA as medium."
+        )
+
+    return ""
+
+
+def generate_recommendation_text(edo, risk, pipeline_config):
+    """
+    Column M "Recommendation" block.
+
+    Only ever generated when the record's Risk Classification (Column
+    L) is "High" - Medium/Low risk records never get a recommendation.
+    Category-driven (A: User Manual / B: Drawing-Design / C: Training /
+    D: Combined Design+User Manual), generated straight from the
+    record's feature/reason text. Returns "" (nothing printed) when the
+    LLM determines no recommendation is needed, or on failure - no
+    rule-based fallback text is fabricated.
+    """
+    if risk != "High":
+        return ""
+
+    feature_text = format_output_text(edo.get("edo_description") or edo.get("description_2"))
+    reason_text = format_output_text(edo.get("reason_identified") or edo.get("reason_2"))
+
+    if not feature_text and not reason_text:
+        return ""
+
+    rec_prompt = f"""instruction:
+below are the product feature and reason identified as edo.
+and provide the recommendation and remarks 
+Product feature: {feature_text}
+Rason identified as edo: {reason_text}
+
+for example, 
+
+Recommendation: 
+Recommended to include the following details in the user manual to mitigate and control potential power cord damage
+ 
+WARNING: Proper Use and Handling of Power Cord
+To ensure user safety and maintain product integrity, strict adherence to the following instructions regarding the use and handling of the power cord is required:
+
+- The power cord shall be used only as specified in the product instructions.
+- Rough handling, excessive bending, pulling, twisting, or improper storage of the power cord is strictly prohibited.
+- Repeated or improper handling may result in damage to the power cord insulation or internal wiring.
+- Damaged power cords may expose live electrical components, posing a risk of electric shock or serious injury to the user.
+
+Precautionary Measures:
+- Regularly inspect the power cord for signs of wear, damage, or exposed wires.
+- Do not use the device if the power cord is damaged.
+- Replace the power cord immediately if any defect is identified.
+- Handle and store the power cord with care to prevent unnecessary stress or damage.
+
+this is the sample response to be retrieved as output.
+"""
+
+    try:
+        rec_response = call_llm(rec_prompt, pipeline_config, question="provide recommendation and warning/precaution for the given product feature and reason identified as edo")
+        rec_response = clean_response(rec_response)
+        if is_meaningful_llm_text(rec_response):
+            return rec_response.strip()
+    except Exception as e:
+        logging.error(f"Recommendation generation failed: {e}")
+
+    return ""
+
+
+def generate_remarks_and_recommendation(
+    edo,
+    tag_value,
+    is_new,
+    risk,
+    pipeline_config,
+    edo_document=None,
+    risk_eval_prompt_data=None,
+    traceability_fail_remarks=None
+):
     """
     Builds Column M ("Remarks and Recommendation") content:
-      1. Boilerplate Gap + Verification Status (New EDO vs Existing EDO wording)
-      2. Optional "Observation" block - flagged when the FMEA/RA&C trace text
-         (Column D) states a DIFFERENT risk level than the assigned Risk
-         Classification (Column L)
-      3. Optional "Recommendation"/"Design" block - category-driven, feature-specific
-         safety mitigation text (manual warning, drawing note, training, or combined),
-         generated from EDO feature/reason fields.
+      1. Gap + Verification Status boilerplate (New EDO vs Existing EDO wording) - always printed.
+      2. Traceability Fail remarks - one line per verification code whose
+         traceability call (CALL 7) came back with a Fail result (see
+         build_final_edos_with_traceability()); omitted entirely when there
+         are none.
+      3. Observation - only when this record's FMEA has Risk_Evaluation == "Low"
+         (see generate_observation_text()); nothing (not even a heading) is
+         printed when it's "Medium" or anything else.
+      4. Recommendation (including any Warning/Precaution line) - only when
+         Risk Classification (Column L) == "High" (see generate_recommendation_text()).
+    Only the generated text itself is printed for (2)/(3)/(4) - no extra
+    headings/titles are added - and each block is entirely omitted when
+    it isn't applicable, leaving just the Gap and Verification Status text.
     """
 
-    # ---- 1. Base boilerplate (Gap + Verification Status) ----
+    # ---- 1. Base boilerplate (Gap + Verification Status) - kept as-is ----
     if is_new:
         base_text = (
             "Gap:\n"
             "As identified in the Risk Assessment & Control (RA&C) and System "
-            "DFMEA, this risk impacts the product’s functions and features. "
+            "DFMEA, this risk impacts the product\u2019s functions and features. "
             "Therefore, it is classified as a new Essential Design Output "
             "(EDO) and must be incorporated into the existing EDO list.\n\n"
             "Verification Status:\n"
@@ -3939,91 +4321,28 @@ def generate_remarks_and_recommendation(edo, tag_value, is_new, risk, pipeline_c
             "Reference (Column E)."
         )
 
-    # ---- 2. Observation block (risk-trace mismatch check) ----
+    # ---- 2. Traceability Fail remarks (one line per failed verification code) ----
+    fail_remarks_text = ""
+    if traceability_fail_remarks:
+        fail_remarks_text = "\n".join(traceability_fail_remarks)
+
+    # ---- 3. Observation (Sys-FMEA Risk_Evaluation == "Low" only) ----
     observation_text = ""
-    dfmea_text = format_output_text(edo.get("dfmea"))
+    if edo_document is not None and risk_eval_prompt_data is not None:
+        observation_text = generate_observation_text(
+            pipeline_config,
+            edo_document,
+            risk_eval_prompt_data,
+            edo.get("RA_Number", ""),
+            edo.get("FMEA_Number", "")
+        )
 
-    if dfmea_text and risk:
-        obs_prompt = f"""
-You are reviewing an Essential Design Output (EDO) risk record.
+    # ---- 4. Recommendation (only when risk == "High") ----
+    recommendation_text = generate_recommendation_text(edo, risk, pipeline_config)
 
-Risk Classification assigned (Column L): {risk}
-System FMEA / RA&C trace text (Column D): {dfmea_text}
-
-Does the FMEA/RA&C trace text explicitly state a DIFFERENT risk evaluation (e.g., 'Low', 'Medium', 'High') than the assigned Risk Classification above?
-
-If yes, reply with EXACTLY this sentence, filling in the FMEA's stated level and the assigned classification (lowercase):
-Observation: In Sys-FMEA, the risk evaluation is '<fmea_level>'. recommended to change in the sys-FMEA as <assigned_level_lowercase>.
-
-If no mismatch is found, reply with exactly: NONE
-"""
-
-        try:
-            obs_response = call_llm(obs_prompt, pipeline_config)
-            obs_response = clean_response(obs_response)
-            if is_meaningful_llm_text(obs_response):
-                observation_text = obs_response.strip()
-        except Exception as e:
-            logging.error(f"Observation generation failed: {e}")
-
-        # Fallback keyword scan if LLM is unavailable or yields non-answer
-        if not observation_text:
-            observation_text = _fallback_observation_text(dfmea_text, risk)
-
-    # ---- 3. Recommendation / Design block (feature-specific safety mitigation) ----
-    recommendation_text = ""
-    feature_text = format_output_text(edo.get("edo_description") or edo.get("description_2"))
-    reason_text = format_output_text(edo.get("reason_identified") or edo.get("reason_2"))
-
-    if feature_text or reason_text:
-        rec_prompt = f"""
-You are preparing the "Recommendation" section of an Essential Design Output checklist.
-
-Study the Product Feature and Reason Identified below:
-Product Feature/Function: {feature_text}
-Reason Identified as EDO: {reason_text}
-
-First, determine which category best applies:
-
-Category A: User Manual recommendation
-- Use if the feature involves: electrical safety, cables, power cord, hoses, connectors, patient interaction, warning labels, handling, cleaning, maintenance, storage, or placement/stability.
-
-Category B: Drawing/Design recommendation
-- Use if the feature involves: dimensions, tolerances, load ratings, drawings, materials, CAD, mechanical strength, or hardware specs.
-
-Category C: Training recommendation
-- Use if users/operators must be specifically instructed before using or connecting the product to mitigate risk of misuse.
-
-Category D: Combined Design and User Manual
-- Use if both drawing/design specifications AND user manual caution/warning statements are required.
-
-Category E: No recommendation
-- Reply with NONE if the base Gap and Verification Status boilerplate is already completely sufficient.
-
-RULES:
-1. Write concrete, domain-specific engineering recommendations matched to the exact component. Do NOT write generic or vague placeholders.
-2. If Category A, format headers as "Recommendation:" or "Recommendation to add in the User Manual:" followed by bulleted/structured warnings or precautions.
-3. If Category B, start with "Design:" or "Recommendation:" specifying drawing notes or load/dimensional limits.
-4. If Category C, start with "Recommendation:" specifying operator training parameters.
-5. Return ONLY the recommendation text block itself (or NONE). Do not repeat Gap or Verification text.
-"""
-
-        try:
-            rec_response = call_llm(rec_prompt, pipeline_config)
-            rec_response = clean_response(rec_response)
-            if is_meaningful_llm_text(rec_response):
-                recommendation_text = rec_response.strip()
-        except Exception as e:
-            logging.error(f"Recommendation generation failed: {e}")
-
-        # Expanded rule-based classification fallback engine
-        if not recommendation_text:
-            recommendation_text = _fallback_recommendation_text(
-                feature_text, reason_text, risk
-            )
-
-    # ---- Assemble final Column M text ----
     parts = [base_text]
+    if fail_remarks_text:
+        parts.append(fail_remarks_text)
     if observation_text:
         parts.append(observation_text)
     if recommendation_text:
@@ -4032,134 +4351,6 @@ RULES:
     return "\n\n".join(parts)
 
 
-def _fallback_observation_text(dfmea_text, risk):
-    """
-    Rule-based fallback for the Observation block when LLM fails.
-    Scans FMEA text for a stated risk word ('low'/'medium'/'high') that disagrees
-    with assigned Risk Classification.
-    """
-    if not dfmea_text or not risk:
-        return ""
-
-    text_lower = dfmea_text.lower()
-    assigned_lower = risk.strip().lower()
-
-    for level in ("low", "medium", "high"):
-        if level == assigned_lower:
-            continue
-        if re.search(rf"\b{level}\b", text_lower):
-            return (
-                f"Observation: In Sys-FMEA, the risk evaluation is '{level}'. "
-                f"recommended to change in the sys-FMEA as {assigned_lower}."
-            )
-
-    return ""
-
-
-def _fallback_recommendation_text(feature_text, reason_text, risk):
-    """
-    Richer, rule-based classification engine for Recommendations.
-    Matches product components against feature keywords and outputs exact-match
-    domain recommendations matching the house spreadsheet templates.
-    """
-    combined = f"{feature_text} {reason_text}".strip()
-    if not combined:
-        return ""
-
-    combined_lower = combined.lower()
-
-    POWER_CORD = (
-        "power cord", "electrical cord", "mains cable", "power supply cable", "plug"
-    )
-    HANDLE = (
-        "handle", "lifting", "load rating", "load capacity", "carrying handle"
-    )
-    HOSE = (
-        "hose", "tubing", "fluid line", "pneumatic tube", "connector hose"
-    )
-    CONTROL_UNIT = (
-        "control unit", "vibration", "stable surface", "placement", "inclined surface"
-    )
-    CARRY_CASE = (
-        "carrying case", "bag", "storage case", "enclosure case"
-    )
-    TRAINING = (
-        "training", "operator error", "user error", "misuse", "improper use", "incorrect use"
-    )
-    DESIGN = (
-        "drawing", "dimension", "tolerance", "material spec", "part number", "cad", "mechanical"
-    )
-
-    # 1. Power Cord / Electrical Safety
-    if any(k in combined_lower for k in POWER_CORD):
-        return (
-            "Recommendation:\n\n"
-            "Recommended to include the following details in the user manual to mitigate potential power cord damage.\n\n"
-            "WARNING:\n"
-            "Proper Use and Handling of Power Cord\n"
-            "- Use only as instructed.\n"
-            "- Do not bend, twist or pull the power cord.\n"
-            "- Inspect regularly for damage.\n"
-            "- Replace immediately if damaged.\n"
-            "- Damaged cords may expose live electrical parts and cause electric shock."
-        )
-
-    # 2. Handle / Load Ratings (Combined Design + User Manual)
-    if any(k in combined_lower for k in HANDLE):
-        return (
-            "Recommendation:\n\n"
-            "It is recommended to include a drawing note specifying the maximum allowable load for the handle.\n\n"
-            "Additionally, include a caution statement in the user manual indicating that exceeding this load may result in handle failure."
-        )
-
-    # 3. Control Unit Placement & Stability
-    if any(k in combined_lower for k in CONTROL_UNIT):
-        return (
-            "Recommendation to add in the User Manual:\n\n"
-            "The control unit should only be placed on a flat, stable surface during operation.\n"
-            "Do not place the unit on inclined or uneven surfaces.\n"
-            "Keep away from edges to prevent falling."
-        )
-
-    # 4. Carrying Case / Inspection
-    if any(k in combined_lower for k in CARRY_CASE):
-        return (
-            "Recommendation to add in the User Manual:\n\n"
-            "Inspect the carrying case for damage or wear before each transport. "
-            "Ensure all latches and zippers are fully secured prior to lifting."
-        )
-
-    # 5. Hose / Tubing / Connectors
-    if any(k in combined_lower for k in HOSE):
-        return (
-            "Recommendation:\n\n"
-            "Training shall be provided to users prior to handling and connecting the hoses to ensure proper and safe operation, "
-            "and appropriate caution notices shall be documented in the User Manual."
-        )
-
-    # 6. Training Specific
-    if any(k in combined_lower for k in TRAINING):
-        return (
-            "Recommendation:\n\n"
-            "Provide operator/user training addressing the identified condition to reduce the risk of misuse or incorrect operation."
-        )
-
-    # 7. Drawing / Engineering Design Specific
-    if any(k in combined_lower for k in DESIGN):
-        return (
-            "Design:\n\n"
-            f"Update the applicable drawing/design documentation to address the identified condition ({reason_text or feature_text}), "
-            "and add the corresponding EDO symbol/callout so the design output is traceable on the drawing."
-        )
-
-    # 8. General User Manual Fallback
-    return (
-        "Recommendation to add in the User Manual:\n\n"
-        f"Warning/Precaution - {reason_text or feature_text}. Users must be made aware of this condition "
-        "and follow the applicable precautions to avoid impact to product performance or safety."
-    )
-
-# ==========================================================
 # EXCEL FORMATTING
 # ==========================================================
 
@@ -4389,7 +4580,7 @@ def autosize_edo_rows(sheet, start_row, end_row, columns=range(1, 14)):
             sheet.row_dimensions[row].height = needed_height
 
 
-def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=None, new_edo_diagram_queue=None):
+def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=None, new_edo_diagram_queue=None, edo_document=None, risk_eval_prompt_data=None):
     """
     Final writer:
     A-E : existing columns
@@ -4586,7 +4777,10 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             # --- Remarks and Recommendation (Column M) ---
             values[13] = generate_remarks_and_recommendation(
-                edo, tag_value, is_new, risk, pipeline_config
+                edo, tag_value, is_new, risk, pipeline_config,
+                edo_document=edo_document,
+                risk_eval_prompt_data=risk_eval_prompt_data,
+                traceability_fail_remarks=edo.get("traceability_fail_remarks")
             )
 
             for col, value in values.items():
@@ -4885,17 +5079,17 @@ def generate_edo_template(
         # ---------------------------------------------------
         # CALL 4.5: Filter New EDO tags by Risk Evaluation
         # ---------------------------------------------------
-        edo_new_data = filter_new_edo_by_risk_evaluation(
-            client,
-            product_family,
-            product,
-            templatename,
-            pipeline_config,
-            edo_document,
-            edo_new_data,
-            db
-        )
-        print(f"filter_new_edo_by_risk_evaluation: ", edo_new_data)
+        # edo_new_data = filter_new_edo_by_risk_evaluation(
+        #     client,
+        #     product_family,
+        #     product,
+        #     templatename,
+        #     pipeline_config,
+        #     edo_document,
+        #     edo_new_data,
+        #     db
+        # )
+        # print(f"filter_new_edo_by_risk_evaluation: ", edo_new_data)
 
         # ---------------------------------------------------
         # CALL 5: Extract New EDO summary details
@@ -4967,56 +5161,60 @@ def generate_edo_template(
         print(f"verification_details: ", final_edos)
 
         # ---------------------------------------------------
-        # CALL 6B: Stage 1 - Pre-Extract 4 Excel Collections into Separate Lists
+        # CALL 7: Traceability Reference Resolution (per verification code,
+        # one targeted LLM call per code against exactly the one
+        # EDO_TM_1..EDO_TM_4 spreadsheet its tag prefix maps to).
         # ---------------------------------------------------
-        excel_details = {
-            "EXCEL_TM_1_Details": [],
-            "EXCEL_TM_2_Details": [],
-            "EXCEL_TM_3_Details": [],
-            "EXCEL_TM_4_Details": []
-        }
-        
         try:
-            excel_details = extract_excel_sheets_to_separate_lists(
+            final_edos = build_final_edos_with_traceability(
                 client,
                 product_family,
                 product,
                 templatename,
                 pipeline_config,
                 edo_document,
-                db
-            )
-        except Exception as excel_extract_error:
-            logging.warning(
-                "EXCEL EXTRACTION SKIPPED - failed to extract details into 4 lists. "
-                f"Reason: {excel_extract_error}"
-            )
-
-        # ---------------------------------------------------
-        # CALL 6B: Stage 2 - In-Memory Traceability Matching
-        # ---------------------------------------------------
-        try:
-            final_edos = build_final_edos_with_traceability(
                 final_edos,
-                excel_details
+                db
             )
         except Exception as traceability_reference_error:
             logging.warning(
-                "CALL 6B SKIPPED - traceability reference lookup failed. "
+                "CALL 7 SKIPPED - traceability reference lookup failed. "
                 f"Reason: {traceability_reference_error}"
             )
+            # format_edo_worksheet() expects a list of record dicts - if
+            # CALL 7 raised before converting the dict, fall back to a
+            # plain list of its values so downstream formatting still works.
+            if isinstance(final_edos, dict):
+                final_edos = list(final_edos.values())
         print(f"Traceability details: ", final_edos)
 
         # ---------------------------------------------------
         # CALL 7: Output Mapping, Formatting, and Storage
         # ---------------------------------------------------
+        # Pre-fetch the Risk_Evaluation lookup prompt once (used by the
+        # Observation block in generate_remarks_and_recommendation() for
+        # every record) rather than reloading it per record.
+        try:
+            risk_eval_prompt_data = get_prompt(
+                client, product_family, product, templatename,
+                "EDO_NEW_risk_evaluation", db
+            )
+        except Exception as risk_eval_prompt_error:
+            logging.warning(
+                "OBSERVATION: could not load 'EDO_NEW_risk_evaluation' prompt - "
+                f"Observation text will be skipped for this run. Reason: {risk_eval_prompt_error}"
+            )
+            risk_eval_prompt_data = None
+
         format_edo_worksheet(
             sheet,
             final_edos,
             start_row,
             pipeline_config,
             images=edo_proposed_images,
-            new_edo_diagram_queue=new_edo_diagram_queue
+            new_edo_diagram_queue=new_edo_diagram_queue,
+            edo_document=edo_document,
+            risk_eval_prompt_data=risk_eval_prompt_data
         )
 
         output_file = save_edo_workbook(
