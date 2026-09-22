@@ -1607,11 +1607,18 @@ def extract_edo_tags(
         db
     )
 
-    prompt_row = build_prompt_row(
-        prompt,
-        "Extract all Known Active Design Output Tracking Numbers.",
-        max_results=EXISTING_EDO_TAGS_MAX_RESULTS
-    )
+    question = "Extract all Known Active Design Output Tracking Numbers."
+
+    prompt_row = {
+        "prompt_role": prompt["prompt_role"],
+        "prompt_text": prompt["prompt_text"],
+        "question": question,
+        "fulltext": "Yes",
+        "where_filter": "",
+        "where_document": "",
+        "checkpoint": question,
+        "max_results": EXISTING_EDO_TAGS_MAX_RESULTS
+    }
 
     result = execute_prompt(
         pipeline_config,
@@ -1818,11 +1825,16 @@ def extract_edo_details(
             f"Extract the complete row details for the EDO tag requested by the user. Requested EDO Tag: {edo_tag}  Find the row where the EDO Tag exactly matches the requested EDO Ta. Return all available column values for that row, including EDO number/tag, description, reason identified as EDO, RA&C and/or Sys-DFMEA Trace,EDO Location, EDO Description, reason identified as EDO  If the requested EDO tag is not found, return none"
         )
 
-        prompt_row = build_prompt_row(
-            prompt,
-            question,
-            max_results=EXISTING_EDO_DETAILS_MAX_RESULTS
-        )
+        prompt_row = {
+            "prompt_role": prompt["prompt_role"],
+            "prompt_text": prompt["prompt_text"],
+            "question": question,
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": "",
+            "checkpoint": question,
+            "max_results": EXISTING_EDO_DETAILS_MAX_RESULTS
+        }
 
         result = {}
 
@@ -2110,7 +2122,19 @@ def parse_custom_fmea_format(response):
             trace_content,
             re.IGNORECASE | re.DOTALL
         )
-        tags = [t.strip().rstrip(",").strip() for t in raw_tags if t.strip()]
+        # BUGFIX: drop placeholder/status tags such as "Not Available" or
+        # "Not Found" that the LLM sometimes emits as a Trace value when
+        # it has nothing real to report for a document number, instead of
+        # simply omitting the Trace entry. Left unfiltered, these produced
+        # Column D lines like "NPD36569: Not Available" - a non-answer
+        # printed as if it were real trace data. See _is_noise_code(),
+        # shared with parse_verification_codes()'s identical problem on
+        # the New EDO side.
+        tags = [
+            t.strip().rstrip(",").strip()
+            for t in raw_tags
+            if t.strip() and not _is_noise_code(t)
+        ]
 
         if tags:
             # Format as: NPD37819: MRS CU FMEA-391, MRS CU FMEA-463
@@ -2134,7 +2158,15 @@ def _parse_single_edo_trace_response(edo_tag, response):
     def normalize_result(obj):
         if isinstance(obj, dict):
             if "traces" in obj and isinstance(obj["traces"], list):
-                traces = [normalize_text(t) for t in obj["traces"] if normalize_text(t)]
+                # BUGFIX: same noise-token problem as parse_custom_fmea_format()
+                # / parse_verification_codes() - a "traces" entry that is
+                # itself just "Not Available"/"Not Found" placeholder text
+                # is dropped rather than printed into Column D as if it
+                # were a real trace.
+                traces = [
+                    normalize_text(t) for t in obj["traces"]
+                    if normalize_text(t) and not _is_noise_code(t)
+                ]
                 return {"traces": traces}
             if edo_tag in obj and isinstance(obj[edo_tag], dict):
                 return normalize_result(obj[edo_tag])
@@ -2422,7 +2454,7 @@ def extract_new_edo_tags(
         "where_filter": "",
         "where_document": '{"$contains": "See FMEA"}',
         "checkpoint": ('Extract all Appendix A rows whose Risk Evaluation is "See FMEA".'),
-        "max_results": 25,
+        "max_results": 35,
     }
 
     # ---- DIAGNOSTIC: log how many chunks/docs are in this collection,
@@ -2506,6 +2538,9 @@ def extract_new_edo_tags(
         f"extract_new_edo_tags: consolidated {len(edo_new_data)} RA id(s) "
         f"into edo_new_data."
     )
+    logging.info(f"[COUNT] CALL 4 (extract_new_edo_tags): {len(edo_new_data)} candidate RA/FMEA pair(s) identified this run")
+    print ("NEw edo tags:",edo_new_data)
+    return edo_new_data
     print ("NEw edo tags:",edo_new_data)
     return edo_new_data
 
@@ -2562,7 +2597,12 @@ def extract_new_edo_summary_details(
             "where_filter": "",
            # "where_document": {"$contains": "Safety Hazard DFMEA Table"},
            "where_document":"",
-            "checkpoint": ""
+            "checkpoint":  (
+                f"For RA_Number {ra_number} / FMEA_Number {fmea_number} "
+                "only, extract the full EDO detail record as a single "
+                "JSON object, including Risk_Status - no other RA/FMEA pairs."
+            ),
+            "max_result":35
         }
 
         # --- LOGGING: Inspect Prompt Row Filters & Collection state ---
@@ -2662,6 +2702,17 @@ def extract_new_edo_summary_details(
         entry["Reason_Identified_as_EDO_ColH"] = get_llm_value(
             detail_row, "Reason_Identified_as_EDO_ColH", "reason_2"
         )
+        # NEW: Project_code (CP) - identifies which project/CP this New
+        # EDO's FMEA row belongs to. The EDO_NEW_details prompt now also
+        # extracts this (labeled "CP" in the table, trimmed of a leading
+        # "No"). Needed downstream by CALL 7 to disambiguate a
+        # verification code that appears more than once in a
+        # traceability spreadsheet - e.g. a Superseded entry and a
+        # Current entry for the same DRS-### tag under different
+        # PROJECT IDs - see resolve_best_traceability_row().
+        entry["Project_code"] = get_llm_value(
+            detail_row, "Project_code", "Project Code", "CP", "cp"
+        )
 
     # Remove records with no details and records whose Risk_Status is
     # missing or anything other than Medium before the Existing/New merge.
@@ -2673,6 +2724,164 @@ def extract_new_edo_summary_details(
         f"entries in edo_new_data with full detail records "
         f"({len(keys_to_remove)} excluded due to missing details or a "
         "non-Medium Risk_Status)."
+    )
+
+    logging.info(
+        f"[COUNT] CALL 5 (extract_new_edo_summary_details): {len(edo_new_data)} "
+        f"survived (started with {len(edo_new_data) + len(keys_to_remove)}, "
+        f"excluded {len(keys_to_remove)} for missing details / non-Medium Risk_Status)"
+    )
+
+    return edo_new_data
+
+    return edo_new_data
+
+
+def extract_new_edo_trace_details(
+    client,
+    product_family,
+    product,
+    templatename,
+    pipeline_config,
+    edo_document,
+    edo_new_data,
+    db: DatabaseHandler
+):
+    """
+    ADDED - dedicated trace extraction for NEW EDOs, mirroring CALL 3
+    (extract_existing_edo_trace_details()) exactly: same prompt
+    ("EDO_Existing_Trace"), same collection (edo_fmea), same per-EDO
+    call pattern, and the same question wording. The only difference is
+    that a New EDO has no per-record EDO tag of its own (Column A always
+    prints the fixed literal "EDO-XX\nNew") - so the fixed literal
+    "EDO-XX New" is used in place of the per-record edo_tag wherever the
+    Existing-EDO version would have used it.
+    """
+    logging.info("=" * 80)
+    logging.info("STAGE 4C: NEW EDO - TRACE EXTRACTION (per-EDO calls)")
+    logging.info("=" * 80)
+
+    if "edo_fmea" not in edo_document:
+        raise Exception(
+            "EDO_FMEA document/collection not configured - cannot run "
+            "trace extraction."
+        )
+
+    prompt_data = get_prompt(
+        client,
+        product_family,
+        product,
+        templatename,
+        "EDO_Existing_Trace",
+        db
+    )
+
+    results = {}
+    new_edo_tag_label = "EDO-XX New"
+
+    for key, edo in edo_new_data.items():
+        ra_number = edo.get("RA_Number")
+        fmea_number = edo.get("FMEA_Number")
+
+        has_ra = ra_number not in (None, "", "Blank")
+        has_fmea = fmea_number not in (None, "", "Blank")
+
+        if not has_ra and not has_fmea:
+            logging.info(
+                f"extract_new_edo_trace_details: {key} has no "
+                "RA/FMEA number - skipping (empty traces)."
+            )
+            results[key] = {"traces": []}
+            continue
+
+        target = (
+            f"EDO : {new_edo_tag_label}\n"
+            f"RA_Number : {ra_number}\n"
+            f"FMEA_Number : {fmea_number}"
+        )
+
+        prompt_row = {
+            "prompt_role": prompt_data["prompt_role"],
+            "prompt_text": prompt_data["prompt_text"] + "\nTARGET:\n" + target,
+            "question": f"Fetch all trace records for {new_edo_tag_label} (FMEA_Number: {fmea_number})",
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": "",
+            "checkpoint": f"Fetch all trace records for {new_edo_tag_label} (FMEA_Number: {fmea_number})"
+        }
+
+        try:
+            _, _, response = execute_llm_retry(
+                pipeline_config,
+                edo_document["edo_fmea"]["collection"],
+                prompt_row
+            )
+        except Exception as call_error:
+            logging.warning(
+                f"extract_new_edo_trace_details: LLM call failed for "
+                f"{key} after retries - leaving traces empty. "
+                f"Reason: {call_error}"
+            )
+            results[key] = {"traces": []}
+            continue
+
+        edo_result = _parse_single_edo_trace_response(new_edo_tag_label, response)
+        results[key] = edo_result
+
+        logging.info(
+            f"extract_new_edo_trace_details: {key} -> "
+            f"{len(edo_result.get('traces', []))} trace(s) extracted."
+        )
+
+    logging.info("========== NEW EDO PER-EDO TRACE RESULTS (COMBINED) ==========")
+    logging.info(json.dumps(results, indent=2))
+
+    return results
+
+
+def apply_new_edo_trace(edo_new_data, trace_details):
+    """
+    ADDED - mirrors apply_existing_edo_trace() for NEW EDOs: couples the
+    trace records from extract_new_edo_trace_details() back onto
+    edo_new_data, keyed by the SAME key already used in edo_new_data
+    (its RA/FMEA based key), writing into the "existing_trace" field so
+    it flows through merge_new_edo_records() -> build_column_d_reference()
+    the same way it already does for Existing EDOs.
+    """
+    matched_count = 0
+
+    if not isinstance(trace_details, dict):
+        logging.warning(
+            "apply_new_edo_trace: trace_details was not a dict "
+            f"(got {type(trace_details).__name__}) - nothing to apply."
+        )
+        return edo_new_data
+
+    for key, row in trace_details.items():
+        if not isinstance(row, dict):
+            continue
+
+        edo = edo_new_data.get(key)
+        if edo is None:
+            logging.warning(
+                f"apply_new_edo_trace: no New EDO found matching key "
+                f"{key!r} - skipping."
+            )
+            continue
+
+        traces = row.get("traces") or row.get("Traces") or []
+        lines = [normalize_text(t) for t in traces if isinstance(t, str) and normalize_text(t)]
+
+        if lines:
+            edo["existing_trace"] = "\n".join(lines)
+            matched_count += 1
+        else:
+            edo["existing_trace"] = ""
+
+    logging.info(
+        f"apply_new_edo_trace: populated existing_trace on "
+        f"{matched_count} new-EDO match(es) out of {len(trace_details)} "
+        "trace response(s)."
     )
 
     return edo_new_data
@@ -3166,8 +3375,29 @@ def merge_new_edo_records(new_records, existing_edos):
 
             "RA_Number": ra_number,
             "FMEA_Number": fmea_number,
+
+            # Carries through the New EDO trace populated by
+            # extract_new_edo_trace_details() / apply_new_edo_trace()
+            # (mirrors "existing_trace" on Existing EDOs) so
+            # build_column_d_reference() picks it up the same way.
+            "existing_trace": row.get("existing_trace", ""),
+
+            # NEW: Project_code (CP) - carried through onto the merged
+            # record so CALL 7 (build_final_edos_with_traceability) can
+            # use it to disambiguate a verification code that matches
+            # multiple rows in a traceability spreadsheet (e.g. a
+            # Superseded vs Current entry for the same DRS-### tag under
+            # different PROJECT IDs) - see resolve_best_traceability_row().
+            # Existing EDOs never carry this field, so
+            # final_record.get("Project_code", "") downstream simply
+            # returns "" for them and CP-based narrowing is skipped,
+            # matching prior behaviour for Existing EDOs.
+            "Project_code": _normalize_project_code(
+                get_llm_value(row, "Project_code", "Project Code", "CP", "cp")
+            ),
         }
 
+    logging.info(f"[COUNT] merge_new_edo_records: {len(merged)} New EDO(s) survived dedup against Existing")
     return merged
 
 
@@ -3517,7 +3747,7 @@ def extract_and_apply_verification_details(
             "where_filter": "",
             "where_document": "",
             "checkpoint": f"Fetch risk controls values for {fmea_number} and {ra_number}",
-            "max_results": 25
+            "max_results": 35
         }
 
         try:
@@ -3622,10 +3852,21 @@ def _normalize_llm_key(key):
 def get_llm_value(row, *keys):
     """
     Returns the first valid, non-empty value found across `keys`.
-    Treats None, "", and any case-insensitive "none"/"blank" placeholder
-    text (e.g. "None", "NONE", "Blank") as invalid/empty, so literal
-    placeholder strings coming back from the LLM never get written to
-    the output Excel as if they were real data.
+    Treats None, "", any case-insensitive "none"/"blank" placeholder
+    text (e.g. "None", "NONE", "Blank"), AND any noise/placeholder
+    status text recognized by _is_noise_code() (e.g. "na", "n/a",
+    "Not Available", "Not Found", "unknown", "tbd") as invalid/empty.
+
+    BUGFIX: previously this only filtered "none"/"blank" - every other
+    placeholder the LLM commonly returns for a missing field (e.g.
+    "na", "Not Available", "Not Found") passed straight through as if
+    it were real data. Callers such as build_final_edos_with_traceability()
+    already have "or" fallback chains for exactly this situation (e.g.
+    `get_llm_value(row, "vv_record_file_name", ...) or source_document_name
+    or "Unknown File"`), but those fallbacks never fired because the
+    placeholder text was truthy and non-empty. Filtering noise text here
+    lets those fallbacks work as originally intended, instead of writing
+    "na"/"Not Available"/"Not Found" straight into the output Excel.
     """
     if not isinstance(row, dict):
         return ""
@@ -3637,7 +3878,7 @@ def get_llm_value(row, *keys):
         if value is None:
             continue
         text = str(value).strip()
-        if text == "" or text.lower() in ("none", "blank"):
+        if text == "" or text.lower() in ("none", "blank") or _is_noise_code(text):
             continue
         return value
     return ""
@@ -3672,6 +3913,35 @@ def _strip_wrapping_quotes_and_brackets(token: str) -> str:
     return token
 
 
+# BUGFIX: CALL 5's Verification_Reference extraction (New EDOs) sometimes
+# sweeps in document-status text from the FMEA table alongside the real
+# control tags - e.g. a raw value like "NPD36569 Not Available, MRS
+# Software FMEA-428, ..., MRS Software FMEA-431 Not Found" - instead of
+# the clean comma-separated tag list the prompt asks for. Comma-split by
+# parse_verification_codes(), tokens like "NPD36569 Not Available" and
+# "MRS Software FMEA-431 Not Found" then get treated as if they were real
+# verification codes: CALL 7 dutifully "resolves" them against the
+# traceability documents (via _find_code_in_record()'s fallback substring
+# scan) and prints garbage rows like "NPD36569 Not Available - Not
+# Available" straight into Column E. _is_noise_code() recognizes and
+# drops these before they're ever treated as codes.
+_NOISE_CODE_PATTERN = re.compile(
+    r'\b(not\s+available|not\s+found|no\s+match(?:\s+found)?|n/?a|unknown|tbd)\b',
+    re.IGNORECASE
+)
+
+
+def _is_noise_code(code: str) -> bool:
+    """
+    True when `code` is placeholder/status text that leaked in alongside
+    real verification codes (see _NOISE_CODE_PATTERN), rather than an
+    actual requirement/verification code such as "DRS-570" or "MS CU
+    Mod-384". A genuine code never contains these status words, so any
+    match here is enough to drop the token.
+    """
+    return bool(_NOISE_CODE_PATTERN.search(normalize_text(code)))
+
+
 def parse_verification_codes(verification_ref_str: str) -> List[str]:
     """
     Parses a verification string into a clean list of individual code strings,
@@ -3682,17 +3952,23 @@ def parse_verification_codes(verification_ref_str: str) -> List[str]:
       - Python tuple repr (str): "('DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39')"
     In every case the output is the same clean list:
       ['DRS-570', 'MS CU Mod-384', 'SRS-CTRL-39']
+
+    Tokens that are placeholder/status noise rather than real codes (e.g.
+    "NPD36569 Not Available", "MRS Software FMEA-431 Not Found" - see
+    _is_noise_code()) are dropped from every return path, so they never
+    reach CALL 7's resolution or Column E.
     """
     if not verification_ref_str:
         return []
 
     # Already an actual list/tuple (not a string) - just clean each element.
     if isinstance(verification_ref_str, (list, tuple, set)):
-        return [
+        cleaned = [
             _strip_wrapping_quotes_and_brackets(str(c))
             for c in verification_ref_str
             if str(c).strip()
         ]
+        return [c for c in cleaned if c and not _is_noise_code(c)]
 
     raw_str = str(verification_ref_str).strip()
     if not raw_str:
@@ -3707,11 +3983,12 @@ def parse_verification_codes(verification_ref_str: str) -> List[str]:
         try:
             parsed = ast.literal_eval(raw_str)
             if isinstance(parsed, (list, tuple, set)):
-                return [
+                cleaned = [
                     _strip_wrapping_quotes_and_brackets(str(c))
                     for c in parsed
                     if str(c).strip()
                 ]
+                return [c for c in cleaned if c and not _is_noise_code(c)]
         except (ValueError, SyntaxError):
             # Not valid Python literal syntax - fall through to manual
             # stripping below rather than failing outright.
@@ -3723,7 +4000,7 @@ def parse_verification_codes(verification_ref_str: str) -> List[str]:
         for code in raw_str.split(",")
         if code.strip()
     ]
-    return [code for code in codes if code]
+    return [code for code in codes if code and not _is_noise_code(code)]
 
 
 
@@ -3751,6 +4028,22 @@ def parse_verification_codes(verification_ref_str: str) -> List[str]:
 # common case down to ~1 call per EDO per distinct prefix, same as the
 # old fixed-bucket approach, while making no assumption about prefix
 # naming, document count, or document order.
+#
+# CP / RECORD STATUS DISAMBIGUATION: a single verification code can
+# legitimately appear on MORE than one row of a traceability document -
+# e.g. a Superseded entry and a Current entry for the same DRS-###
+# tag, filed under different PROJECT IDs:
+#
+#     DRS-594 | ... | PRJ8611715 | Superseded
+#     DRS-594 | ... | PRJ8611715 | Current
+#
+# _query_traceability_details_batch() therefore keeps EVERY matching row
+# per code (not just the first one found), and
+# resolve_best_traceability_row() picks the one that's actually correct
+# for a given EDO: prefer a row whose PROJECT ID matches the EDO's own
+# Project_code (CP, extracted in CALL 5 from the FMEA table), then
+# prefer RECORD STATUS "Current" over "Superseded" among whatever
+# remains.
 
 
 def _code_prefix_hint(code: str) -> str:
@@ -3770,6 +4063,126 @@ def _code_prefix_hint(code: str) -> str:
     return re.sub(r"[\s_-]+", " ", prefix).strip().upper()
 
 
+def _normalize_project_code(value):
+    """
+    Canonicalizes a project/CP identifier for comparison, e.g.
+    "PRJ8611715", " prj-8611715 ", "No.PRJ8611715" all collapse to the
+    same "PRJ8611715" token. Used on BOTH sides of the PROJECT ID
+    comparison in resolve_best_traceability_row(), so minor formatting
+    differences between what CALL 5 extracted (Project_code, trimmed of
+    a leading "No" per the prompt) and what the traceability sheet's
+    PROJECT ID column actually contains don't silently break the match.
+    Extracts the first PRJ<digits> or SUS<digits> token if one is
+    present; otherwise falls back to an uppercased, alphanumeric-only
+    version of the whole value so an unrecognized-but-still-consistent
+    format still compares equal to itself.
+    """
+    text = normalize_text(value).upper()
+    if not text:
+        return ""
+    match = re.search(r'\b(PRJ|SUS)\s*[-#]?\s*(\d+)', text)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return re.sub(r'[^A-Z0-9]', '', text)
+
+
+def resolve_best_traceability_row(candidate_rows: List[dict], project_code: str):
+    """
+    Given every traceability-spreadsheet row that matched a single
+    verification code (see _query_traceability_details_batch()'s
+    rows_by_code, a list per code rather than one row), picks the ONE
+    row that is actually correct for this EDO - a code like DRS-594 can
+    legitimately appear more than once in the sheet, e.g.:
+
+        DRS-594 | ... | PRJ8611715 | Superseded
+        DRS-594 | ... | PRJ8611715 | Current
+
+    Resolution order:
+      1. If `project_code` is set and one or more candidate rows have a
+         PROJECT ID matching it (compared via _normalize_project_code()
+         on both sides, so minor formatting differences don't break the
+         match), narrow to just those rows first.
+      2. Among whatever remains, prefer a row whose RECORD STATUS says
+         "Current" over "Superseded" (substring match, case-insensitive,
+         so "Current Revision" etc. still match).
+      3. If more than one row is still tied after both filters, the
+         first one (original response order) is used - the old
+         first-match behaviour, now only as a last-resort tiebreaker
+         instead of unconditionally discarding every other match.
+
+    Returns a single row dict, or None if candidate_rows is empty.
+    """
+    if not candidate_rows:
+        return None
+    if len(candidate_rows) == 1:
+        return candidate_rows[0]
+
+    project_code_norm = _normalize_project_code(project_code)
+    pool = candidate_rows
+
+    if project_code_norm:
+        cp_matches = [
+            row for row in candidate_rows
+            if _normalize_project_code(
+                get_llm_value(
+                    row,
+                    "Project_ID", "Project Id", "PROJECT ID",
+                    "Project_Code", "Project Code", "CP", "cp"
+                )
+            ) == project_code_norm
+        ]
+        if cp_matches:
+            pool = cp_matches
+
+    current_matches = [
+        row for row in pool
+        if "current" in normalize_text(
+            get_llm_value(
+                row,
+                "Record_Status", "Record Status", "RECORD STATUS",
+                "Status", "status"
+            )
+        ).lower()
+    ]
+    if current_matches:
+        pool = current_matches
+
+    return pool[0]
+
+
+# BUGFIX: some traceability documents act as a master index/table of
+# contents that lists nearly every req_tag but with a blank or "N/A"
+# V/V Record Location and V/V Record File Name (e.g. "Vest APX Control
+# Unit Module Verification Traceability Spreadsheet Rev 5.xlsx" matched
+# DRS-570, DRS-687, SRS-CTRL-39, SRS-CTRL-53, etc. this way). Before this
+# fix, resolve_best_traceability_row() accepted ANY non-empty candidate
+# list as a final answer - so the first code with a given prefix (e.g.
+# "DRS") to hit this index document got "resolved" against a blank row,
+# warmed prefix_cache to point at that index document, and every
+# SUBSEQUENT code sharing that prefix then went straight to the cache
+# hit path, matched the same blank index row, and was marked resolved
+# too - permanently starving out the real source document (which may sit
+# later in traceability_documents) from ever being tried. This is why
+# DRS-570 regressed from a real answer ("NPD43975 rev 3 - vest apx
+# software features verification tdr") to "N/A - Vest APX Control Unit
+# Module Verification Traceability Spreadsheet Rev 5.xlsx".
+def _has_real_traceability_content(row: dict) -> bool:
+    """
+    True when `row` carries a genuine V/V Record Location or V/V Record
+    File Name - not blank, and not a placeholder like "N/A"/"Not Found"
+    (reusing _is_noise_code(), the same check already used to keep
+    placeholder text out of parsed verification codes). A row that fails
+    this check is treated as a low-quality index-only match: still kept
+    as a last-resort fallback, but never accepted as final while any
+    other configured document hasn't been tried yet.
+    """
+    location = get_llm_value(row, "vv_record_location", "VV_Record_Location")
+    filename = get_llm_value(row, "vv_record_file_name", "VV_Record_File_Name")
+    location_ok = bool(location) and not _is_noise_code(location)
+    filename_ok = bool(filename) and not _is_noise_code(filename)
+    return location_ok or filename_ok
+
+
 # Maximum number of codes sent to the LLM in a single traceability
 # detail-extraction call. Batching too many codes into one call (e.g.
 # 15+ at once) causes the LLM to fully detail only the first couple and
@@ -3787,13 +4200,16 @@ def _query_traceability_details_chunked(pipeline_config, collection, prompt_data
     chunks of at most TRACEABILITY_CODE_CHUNK_SIZE before querying, so a
     long code list for one EDO doesn't get crammed into a single LLM
     call. Issues one call per chunk and merges the results back into a
-    single {code: row} dict, same return contract as
-    _query_traceability_details_batch() itself.
+    single {code: [row, ...]} dict, same return contract as
+    _query_traceability_details_batch() itself - each value is now a
+    LIST of every matching row for that code (see
+    resolve_best_traceability_row()), so chunks are merged by
+    concatenating each code's row list rather than overwriting it.
     """
     if not codes:
         return {}
 
-    merged: Dict[str, dict] = {}
+    merged: Dict[str, List[dict]] = {}
     for i in range(0, len(codes), TRACEABILITY_CODE_CHUNK_SIZE):
         chunk = codes[i:i + TRACEABILITY_CODE_CHUNK_SIZE]
         chunk_result = _query_traceability_details_batch(
@@ -3801,9 +4217,10 @@ def _query_traceability_details_chunked(pipeline_config, collection, prompt_data
         )
         logging.info(
             f"CALL 7 (chunk {i // TRACEABILITY_CODE_CHUNK_SIZE}): "
-            f"codes {chunk} -> {len(chunk_result)} matched with full detail"
+            f"codes {chunk} -> {len(chunk_result)} code(s) with matches"
         )
-        merged.update(chunk_result)
+        for code, rows in chunk_result.items():
+            merged.setdefault(code, []).extend(rows)
     return merged
 
 
@@ -3824,7 +4241,8 @@ def search_codes_across_documents(
     traceability_documents,
     prompt_data,
     codes: List[str],
-    prefix_cache: Dict[str, int]
+    prefix_cache: Dict[str, int],
+    project_code: str = ""
 ):
     """
     Resolves `codes` (this EDO's still-unmatched verification codes)
@@ -3841,16 +4259,75 @@ def search_codes_across_documents(
     cache, query document 1 with the remainder, and so on until every
     code is resolved or every document has been tried.
 
+    `project_code` is this EDO's CP/PROJECT ID (see CALL 5's
+    Project_code field) - when a code matches MULTIPLE rows in a
+    traceability document (e.g. a Superseded + Current entry for the
+    same tag under different PROJECT IDs), resolve_best_traceability_row()
+    uses it to pick the row that actually belongs to this EDO's project,
+    preferring a "Current" RECORD STATUS row when the project itself
+    doesn't disambiguate it.
+
+    BUGFIX: a match with no real V/V Record Location or File Name (see
+    _has_real_traceability_content()) is no longer accepted as final the
+    moment it's found. Some traceability documents act as a master
+    index that returns a blank/"N/A" row for almost every code - taking
+    the first such match as final would (a) stop the search before the
+    real source document (which may sit later in the list) is ever
+    tried, and (b) warm prefix_cache to point every later code sharing
+    that prefix straight at the same blank index document, compounding
+    the problem across the whole run. Low-quality matches are instead
+    kept as a LAST-RESORT fallback per code while the search keeps
+    trying every remaining document for a real one; the fallback is
+    only used, and the cache only warmed, once no document produced
+    anything better.
+
     Returns a dict keyed by the ORIGINAL code string -> that code's
-    matched record (dict). A code with no match anywhere is simply
-    absent from the returned dict - same contract as the old
-    _query_traceability_details_batch().
+    resolved record (dict). A code with no match anywhere - not even a
+    low-quality one - is simply absent from the returned dict.
     """
     remaining = list(dict.fromkeys(codes))  # de-dup, preserve order
     resolved: Dict[str, dict] = {}
+    # Best low-quality (blank location/filename) match seen so far per
+    # code, kept only as a last resort if no document ever yields a real
+    # one. Never written into `resolved` or the prefix cache directly.
+    fallback: Dict[str, dict] = {}
 
     if not remaining or not traceability_documents:
         return resolved
+
+    def _consider_match(code, candidate_rows, doc_index, doc_name):
+        """
+        Resolves the best row for `code` from `candidate_rows` (one
+        document's matches) and either accepts it as final (real
+        content) or stashes it as a fallback (blank/placeholder
+        content only). Returns True if `code` should be treated as
+        resolved and dropped from further document search.
+        """
+        row = resolve_best_traceability_row(candidate_rows, project_code)
+        if not row:
+            return False
+
+        if _has_real_traceability_content(row):
+            resolved[code] = {"row": row, "document_index": doc_index, "document_name": doc_name}
+            if len(candidate_rows) > 1:
+                logging.info(
+                    f"  RESOLVED | Code: {code} - {len(candidate_rows)} "
+                    f"candidate row(s), picked PROJECT ID/STATUS-resolved match."
+                )
+            prefix = _code_prefix_hint(code)
+            if prefix:
+                prefix_cache[prefix] = doc_index
+            return True
+
+        if code not in fallback:
+            fallback[code] = {"row": row, "document_index": doc_index, "document_name": doc_name}
+            logging.info(
+                f"  LOW-QUALITY MATCH (index-only, no location/filename) | "
+                f"Code: {code} - document #{doc_index} ({doc_name}) - kept as "
+                "fallback only, still searching remaining documents for a "
+                "real match."
+            )
+        return False
 
     # ---- Fast path: try each remaining code's cached document first ----
     # Group codes by their cached document index (if any) so codes
@@ -3878,15 +4355,15 @@ def search_codes_across_documents(
         )
         logging.info(
             f"CALL 7 (cache hit): document #{doc_index} ({doc_name}) | "
-            f"codes tried: {cached_codes} -> {len(rows_by_code)} matched"
+            f"codes tried: {cached_codes} -> {len(rows_by_code)} code(s) with matches"
         )
-        for code, row in rows_by_code.items():
-            resolved[code] = {"row": row, "document_index": doc_index, "document_name": doc_name}
+        for code, candidate_rows in rows_by_code.items():
+            _consider_match(code, candidate_rows, doc_index, doc_name)
 
         for code in cached_codes:
             if code not in resolved:
-                # Cache hint was wrong for this code (prefix collision or
-                # document contents changed) - fall through to the full
+                # Cache hint was wrong (or only produced a low-quality
+                # fallback) for this code - fall through to the full
                 # round-robin search below instead of giving up.
                 no_cache_hint.append(code)
 
@@ -3912,23 +4389,29 @@ def search_codes_across_documents(
         )
         logging.info(
             f"CALL 7 (search): document #{doc_index} ({doc_name}) | "
-            f"codes tried: {remaining} -> {len(rows_by_code)} matched"
+            f"codes tried: {remaining} -> {len(rows_by_code)} code(s) with matches"
         )
 
         still_unmatched = []
         for code in remaining:
-            row = rows_by_code.get(code)
-            if row:
-                resolved[code] = {"row": row, "document_index": doc_index, "document_name": doc_name}
-                # Warm the cache so later EDOs with the same code prefix
-                # try this document first instead of searching from 0.
-                prefix = _code_prefix_hint(code)
-                if prefix:
-                    prefix_cache[prefix] = doc_index
-            else:
+            candidate_rows = rows_by_code.get(code, [])
+            if not _consider_match(code, candidate_rows, doc_index, doc_name):
                 still_unmatched.append(code)
 
         remaining = still_unmatched
+
+    # ---- Last resort: use whatever low-quality (blank) match was found,
+    # for any code that never got a real match from any document ----
+    for code in list(remaining):
+        if code in fallback:
+            resolved[code] = fallback[code]
+            logging.info(
+                f"CALL 7: no document had a real V/V location/filename for "
+                f"{code!r} - using the index-only match from document "
+                f"#{fallback[code]['document_index']} "
+                f"({fallback[code]['document_name']}) as a last resort."
+            )
+            remaining.remove(code)
 
     if remaining:
         logging.info(
@@ -3946,12 +4429,35 @@ def _match_record_to_code(value, codes: List[str]):
     query, so a multi-record batch response can be split back apart
     per original code. Comparison ignores spaces/underscores/hyphens
     and case, e.g. "DRS-570" matches "DRS 570" or "drs_570".
+
+    BUGFIX: previously this matched on two-way substring containment
+    ONLY, with no exact-match preference. In a batched query (see
+    TRACEABILITY_CODE_CHUNK_SIZE), a shorter/similar code that happens
+    to be a substring of another queued code - e.g. "DRS-65" is a
+    substring of "DRS-651" - could "win" the match for a row that
+    actually belongs to the longer code, whichever code happened to be
+    checked first in the loop. That misattributed a real test
+    report's traceability row to the wrong RA/FMEA record. An exact
+    normalized match is now tried first across every code before any
+    substring fallback is considered, so a genuine "DRS-651" row can
+    never be stolen by an unrelated "DRS-65" code.
     """
     if not value:
         return None
     normalized_value = re.sub(r'[\s_-]+', '', str(value)).upper()
     if not normalized_value:
         return None
+
+    # 1. Exact match first - avoids cross-contamination between
+    #    similar/overlapping codes (e.g. "DRS-65" vs "DRS-651").
+    for code in codes:
+        normalized_code = re.sub(r'[\s_-]+', '', str(code)).upper()
+        if normalized_code and normalized_code == normalized_value:
+            return code
+
+    # 2. Substring containment fallback - only used when no code
+    #    matched exactly, same behaviour as before for genuinely
+    #    partial/fuzzy record values.
     for code in codes:
         normalized_code = re.sub(r'[\s_-]+', '', str(code)).upper()
         if normalized_code and (normalized_code in normalized_value or normalized_value in normalized_code):
@@ -3979,11 +4485,17 @@ def _query_traceability_details_batch(pipeline_config, collection, prompt_data, 
     SINGLE call - e.g. if 2 codes are still unresolved for one EDO, both
     are sent together in one call instead of two separate calls.
 
-    Returns a dict keyed by the ORIGINAL code string -> that code's
-    matched record (dict), e.g.:
-        {"DRS-570": {...row...}, "DRS-680": {...row...}}
-    A code with no matching record in the LLM's response is simply
-    absent from the returned dict (caller treats that as "no match").
+    Returns a dict keyed by the ORIGINAL code string -> a LIST of every
+    matching record for that code, e.g.:
+        {"DRS-594": [{...Superseded row...}, {...Current row...}]}
+    A code can legitimately appear on more than one row of a
+    traceability document (e.g. a Superseded entry and a Current entry
+    for the same tag under different PROJECT IDs) - every matching
+    record is kept here instead of only the first one found, so the
+    caller (resolve_best_traceability_row(), via
+    search_codes_across_documents()) can pick the correct row per EDO
+    based on PROJECT ID / RECORD STATUS. A code with no matching record
+    in the LLM's response is simply absent from the returned dict.
     """
     if not codes:
         return {}
@@ -3999,7 +4511,7 @@ def _query_traceability_details_batch(pipeline_config, collection, prompt_data, 
         "where_filter": "",
         "where_document": "",
         "checkpoint": question,
-        "max_results": max(25, 25 * len(codes))
+        "max_results": max(35, 35 * len(codes))
     }
 
     try:
@@ -4014,8 +4526,14 @@ def _query_traceability_details_batch(pipeline_config, collection, prompt_data, 
         records = [parsed]
 
     # Split the batch response back apart: match each returned record to
-    # the one code (out of the codes we sent) it actually belongs to.
-    rows_by_code = {}
+    # the one code (out of the codes we sent) it actually belongs to. A
+    # code can legitimately have MULTIPLE rows in the traceability sheet
+    # (e.g. a Superseded entry and a Current entry for the same DRS-###
+    # tag, each tied to a different PROJECT ID) - so every matching
+    # record is kept here, and resolve_best_traceability_row() (called
+    # by the caller) picks the single right one afterward instead of
+    # this function silently discarding all but the first.
+    rows_by_code: Dict[str, List[dict]] = {}
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -4023,8 +4541,8 @@ def _query_traceability_details_batch(pipeline_config, collection, prompt_data, 
         matched_code = _match_record_to_code(req_tag_value, codes) if req_tag_value else None
         if not matched_code:
             matched_code = _find_code_in_record(record, codes)
-        if matched_code and matched_code not in rows_by_code:
-            rows_by_code[matched_code] = record
+        if matched_code:
+            rows_by_code.setdefault(matched_code, []).append(record)
 
     return rows_by_code
 
@@ -4054,6 +4572,14 @@ def build_final_edos_with_traceability(
     documents, specific document names, or a fixed set of code prefixes -
     any number of EDO_TM documents, in any order, with any code naming
     scheme, resolve correctly.
+
+    When a code matches more than one row in a traceability document
+    (e.g. a Superseded and a Current entry for the same tag under
+    different PROJECT IDs), search_codes_across_documents() passes this
+    record's own Project_code (CP, extracted in CALL 5 from the FMEA
+    table) through to resolve_best_traceability_row() so the row that
+    actually belongs to this EDO's project - and, failing that, whichever
+    row has RECORD STATUS "Current" - is the one used.
 
     The combined, human-readable trace text for all of a record's codes
     is written back onto `verification_reference` (the same column
@@ -4109,6 +4635,12 @@ def build_final_edos_with_traceability(
 
         ra_number = final_record.get("RA_Number", "")
         fmea_number = final_record.get("FMEA_Number", "")
+        # This EDO's CP/PROJECT ID (New EDOs only - see CALL 5 /
+        # merge_new_edo_records()). Existing EDOs never carry this key,
+        # so .get(...) simply returns "" and resolve_best_traceability_row()
+        # skips CP-based narrowing for them, falling straight to the
+        # RECORD STATUS "Current" preference.
+        project_code = final_record.get("Project_code", "")
 
         ver_ref_str = final_record.get("verification_reference", "")
         parsed_codes = parse_verification_codes(ver_ref_str)
@@ -4116,6 +4648,7 @@ def build_final_edos_with_traceability(
         logging.info("-" * 80)
         logging.info(
             f"EDO Tag: {key!r} | RA_Number: {ra_number!r} | FMEA_Number: {fmea_number!r} "
+            f"| Project_code: {project_code!r} "
             f"-> Verification codes to resolve: {parsed_codes}"
         )
 
@@ -4135,6 +4668,7 @@ def build_final_edos_with_traceability(
             prompt_data,
             parsed_codes,
             prefix_cache,
+            project_code=project_code,
         )
 
         for code in parsed_codes:
@@ -4224,6 +4758,8 @@ def build_final_edos_with_traceability(
 
     logging.info("-" * 80)
     logging.info(f"Processed {len(final_edos)} records into final_edos.")
+    new_edo_count = sum(1 for e in final_edos if e.get("edo_type") == "New")
+    logging.info(f"[COUNT] CALL 7 (build_final_edos_with_traceability): {new_edo_count} New EDO(s) in final output")
     logging.info(f"Prefix -> document index cache learned this run: {prefix_cache}")
     return final_edos
 
@@ -4271,70 +4807,217 @@ VERIFICATION_EVIDENCE_PROMPT_TEXT = """Task:
 
 Review the document and identify:
 
+
 1. The requirement code(s) being verified
- (e.g., DRS-xxx, SRS-CTRL-xxx, MS CU Mod-xxx, MS ACC Mod-xxx).
+
+   (e.g., DRS-xxx, SRS-CTRL-xxx, MS CU Mod-xxx, MS ACC Mod-xxx).
+
 
 2. The evidence used to verify the requirement.
 
-3. The reason the requirement is considered PASSED.
 
 Analysis Rules:
 
+
 A. Code Identification
-- Scan the heading, verification section, objective, meeting minutes, and verification requirement statements.
-- Identify all requirement codes referenced.
-- Determine the primary code associated with the specific requirement wording.
 
-B. Pass Determination
-A code is considered Passed if any of the following evidence exists:
-- Explicit "\u2611 Pass"
-- "VP for <code>" followed by pass result
-- "Review participants agreed..."
-- "The team has agreed..."
-- "Results are sufficient to verify..."
-- "Requirement has been met"
-- "Verification results meet acceptance criteria"
-- "Comply with..."
-- "Passed the requirement"
-- Any documented conclusion indicating successful verification.
+- Scan the document title, heading, objective, verification section, verification requirement statements, meeting minutes, review comments, conclusions, approval records, and traceability references.
 
-C. Condition / Evidence Extraction
-Find and quote the EXACT sentence(s) in the document that state the
-specific condition, criterion, or result that was met - this is the
-literal condition the document itself uses to say the requirement is
-satisfied (or not). Quote it verbatim, do not paraphrase it here.
+- Identify all requirement codes referenced in the section.
 
-D. Reasoning
-Explain in plain language WHY the code passed or failed based on that
-condition/evidence.
+- Determine the primary requirement code associated with the specific requirement being verified.
 
-E. Pass/Fail Determination
-Give a definite verdict of Pass or Fail based on the condition found.
-Only use "Not Determined" if the document truly contains no
-verification conclusion at all for this code - do not default to
-"Not Determined" just because the wording is informal.
+- If multiple requirement codes are referenced, create a separate result only when distinct evidence is tied to that code.
+
+- Do not invent, assume, or infer requirement codes that are not explicitly present in the document.
+
+
+B. Verification Evidence Identification
+
+- Locate the document text used to verify the requirement.
+
+- Consider:
+
+  - Verification statements
+
+  - Requirement verification descriptions
+
+  - Review conclusions
+
+  - Meeting agreements
+
+  - Acceptance criteria
+
+  - Compliance statements
+
+  - Test results
+
+  - Review outcomes
+
+  - Approval records
+
+  - Verification summaries
+
+- Use only evidence explicitly present in the document.
+
+- Do not infer verification outcomes from missing information.
+
+
+C. Evidence Extraction
+
+- Extract ONLY the exact sentence(s) from the document that support verification of the requirement.
+
+- Copy the text verbatim.
+
+- Do not paraphrase.
+
+- Do not summarize.
+
+- Do not interpret the text.
+
+- If multiple sentences are required to capture the evidence, include all relevant sentences.
+
+
+D. Evidence Cleaning Rules
+
+- Exclude standalone status indicators such as:
+
+  - Pass
+
+  - Fail
+
+  - Passed
+
+  - Failed
+
+  - O Pass
+
+  - O Fail
+
+  - ☑ Pass
+
+  - ☑ Fail
+
+  - Checkbox selections
+
+  - Radio button selections
+
+  - Status columns
+
+  - Result columns
+
+  - Table status cells
+
+- Remove trailing status markers even if they appear immediately after the evidence text.
+
+- Preserve only the requirement statement, acceptance criterion, verification condition, result description, review conclusion, or verification conclusion.
+
+- If a status word appears as part of a complete meaningful sentence, retain the full sentence exactly as written.
+
+- Do not append any status wording to the Evidence field.
+
+
+E. Strict Restrictions
+
+- Do NOT determine Pass, Fail, Passed, Failed, Successful, Unsuccessful, Compliant, Non-Compliant, or any equivalent status.
+
+- Do NOT provide explanations.
+
+- Do NOT provide reasoning.
+
+- Do NOT provide analysis.
+
+- Do NOT provide conclusions.
+
+- Do NOT append verdicts to any field.
+
+- Do NOT add labels such as:
+
+  - Pass
+
+  - Fail
+
+  - Passed
+
+  - Failed
+
+  - Status
+
+  - Verification Result
+
+  - Outcome
+
+  - Conclusion
+
+- Do NOT add comments before or after the quoted evidence.
+
+- Other than the exact extracted text, do not introduce additional wording into the Evidence field.
+
+
+F. Confidence Assessment
+
+
+High:
+
+- Requirement code is explicitly identified.
+
+- Evidence directly references the requirement and verification activity.
+
+
+Medium:
+
+- Requirement code is explicitly identified.
+
+- Evidence indirectly supports verification through review, agreement, approval, acceptance, or compliance statements.
+
+
+Low:
+
+- Requirement code is identified but supporting evidence is limited, indirect, or ambiguous.
+
+
+G. Output Requirements
+
+- Produce one result block per requirement code.
+
+- Use only information present in the document.
+
+- Do not include any reasoning or narrative text outside the specified format.
+
+- Do not output Pass/Fail status anywhere.
+
+- Do not infer or report verification outcomes.
+
+- The Evidence field must contain only the extracted document text after applying the Evidence Cleaning Rules.
+
+- Do not add any text beyond the fields defined below.
+
 
 Output Format:
 
+
 Code:
+
 <identified requirement code>
 
+
 Document:
+
 <document name>
 
+
 Heading:
+
 <section heading>
 
-Pass Status:
-Pass / Fail / Not Determined
 
 Evidence:
-<exact condition/sentence quoted verbatim from document>
 
-Why It Passed:
-<clear explanation>
+<exact sentence(s) quoted verbatim from document, with standalone status markers removed>
+
 
 Confidence:
+
 High / Medium / Low"""
 
 def verification_evidence_question(code):
@@ -4425,14 +5108,23 @@ def is_meaningful_evidence_field(value):
     """
     True when a parsed evidence field actually carries content, as
     opposed to being blank or one of the LLM's own "nothing found"
-    placeholders (e.g. "Not Determined", "None", "N/A").
+    placeholders (e.g. "Not Determined", "None", "N/A") - OR the LLM
+    echoing back the prompt's own unfilled instruction text (e.g.
+    "<Exact condition/sentence quoted verbatim from document>") instead
+    of a real answer.
     """
     if not value:
         return False
     normalized = normalize_text(value).strip().strip(".").upper()
     if not normalized:
         return False
-    return normalized not in ("NONE", "N/A", "NA", "NOT DETERMINED", "-", "UNKNOWN")
+    if normalized in ("NONE", "N/A", "NA", "NOT DETERMINED", "-", "UNKNOWN"):
+        return False
+    # Catch the LLM echoing the prompt's own placeholder instruction
+    # instead of filling it in with real content.
+    if "EXACT CONDITION" in normalized and "QUOTED VERBATIM" in normalized:
+        return False
+    return True
 
 
 def parse_verification_reference_code_filename_pairs(edo):
@@ -4621,73 +5313,73 @@ def find_verification_evidence_document(edo_document, filename_hint, doc_number=
     return best_match
 
 
-def _query_verification_evidence_document(pipeline_config, document, code):
-    """
-    Runs the fixed Design Verification Traceability Analyst prompt
-    (VERIFICATION_EVIDENCE_PROMPT_ROLE / _TEXT above) against a single
-    matched document's collection, targeting one requirement code.
-    Returns (fields_dict, raw_llm_response_text).
+VERIFICATION_EVIDENCE_MAX_RESULTS = 60  # was 25 - too shallow for documents with 40+ codes
 
-    The retrieval "question" is built per-code via
-    verification_evidence_question() rather than reused from a single
-    fixed constant - see that function's docstring for why a fixed,
-    code-less question was causing every call to retrieve generic,
-    code-unrelated content and come back "Not Determined".
-    """
+def _code_text_variants(code):
+    code = code.strip()
+    variants = [
+        code,
+        code.replace("-", " "),
+        code.replace(" ", "-"),
+        re.sub(r'[\s-]+', '', code),
+        re.sub(r'[\s-]+', ' ', code),
+        code.replace("Mod-", "Mod "),
+        code.replace("Mod ", "Mod-"),
+        code.replace("CTRL-", "CTRL "),
+        code.replace("CTRL ", "CTRL-"),
+        code.upper(),
+        code.lower(),
+    ]
+    seen = set()
+    out = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _query_verification_evidence_document(pipeline_config, document, code):
     target_text = f"Verification_Reference : {code}"
 
-    prompt_row = {
-        "prompt_role": VERIFICATION_EVIDENCE_PROMPT_ROLE,
-        "prompt_text": VERIFICATION_EVIDENCE_PROMPT_TEXT + "\nTARGETS:\n" + target_text,
-        "question": verification_evidence_question(code),
-        "fulltext": "Yes",
-        "where_filter": "",
-        "where_document": "",
-        "checkpoint": f"Retrieve verification evidence for {code}",
-        "max_results": 25
-    }
+    def _run(where_document, max_results=VERIFICATION_EVIDENCE_MAX_RESULTS):
+        prompt_row = {
+            "prompt_role": VERIFICATION_EVIDENCE_PROMPT_ROLE,
+            "prompt_text": VERIFICATION_EVIDENCE_PROMPT_TEXT + "\nTARGETS:\n" + target_text,
+            "question": verification_evidence_question(code),
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": where_document,
+            "checkpoint": f"Retrieve verification evidence for {code}",
+            "max_results": max_results
+        }
+        return execute_llm_retry(pipeline_config, document["collection"], prompt_row)
 
-    # ---- DIAGNOSTIC: confirm the matched document's collection is
-    # actually populated BEFORE blaming the prompt/question. If every
-    # code/document combination comes back "None"/"Not Determined"
-    # regardless of wording (as observed), the most likely cause is
-    # that these individual source files (test reports, V&V PDFs) were
-    # registered as document metadata but never actually chunked/
-    # embedded into their vector collection - in which case NO amount
-    # of prompt tuning will surface real content, because there is none
-    # to retrieve. This log makes that immediately visible per call.
+    docs, metadata, response = [], None, ""
+    matched_variant = None
+
     try:
-        collection_count = document["collection"].count()
-        logging.info(
-            f"CALL 8 DIAGNOSTIC: collection for "
-            f"{document.get('document_name')!r} (CODE={code!r}) reports "
-            f"{collection_count} indexed chunk(s)."
-        )
-        if collection_count == 0:
-            logging.warning(
-                f"CALL 8 DIAGNOSTIC: {document.get('document_name')!r} has "
-                "ZERO indexed chunks - this document was never actually "
-                "embedded into the vector store, so no evidence can ever "
-                "be retrieved from it regardless of the prompt/question "
-                "used. This is a data-ingestion gap, not a prompt bug - "
-                "check whether this file was processed by the embedding "
-                "pipeline."
+        for variant in _code_text_variants(code):
+            docs, metadata, response = _run(json.dumps({"$contains": variant}))
+            logging.info(
+                f"CALL 8: [{document.get('document_name')}] CODE={code!r} "
+                f"variant={variant!r} retrieved {len(docs) if docs else 0} doc(s)."
             )
-    except Exception as count_error:
-        logging.warning(
-            f"CALL 8 DIAGNOSTIC: could not inspect collection count for "
-            f"{document.get('document_name')!r}: {count_error}"
-        )
+            if docs:
+                matched_variant = variant
+                break
 
-    try:
-        _, _, response = execute_llm_retry(
-            pipeline_config,
-            document["collection"],
-            prompt_row
-        )
+        if not docs:
+            logging.info(
+                f"CALL 8: no text variant of CODE={code!r} matched in "
+                f"{document.get('document_name')!r} - retrying without filter "
+                "and a wider max_results."
+            )
+            docs, metadata, response = _run("", max_results=VERIFICATION_EVIDENCE_MAX_RESULTS * 2)
+
         print(
             f"CALL 8: RAW LLM RESPONSE [{document.get('document_name')}] "
-            f"CODE={code!r} -> {response!r}"
+            f"CODE={code!r} (matched_variant={matched_variant!r}) -> {response!r}"
         )
     except Exception as e:
         logging.error(
@@ -4697,10 +5389,6 @@ def _query_verification_evidence_document(pipeline_config, document, code):
         return {}, ""
 
     fields = parse_verification_evidence_fields(response)
-    print(
-        f"CALL 8: PARSED EVIDENCE FIELDS [{document.get('document_name')}] "
-        f"CODE={code!r} -> {fields!r}"
-    )
     return fields, response
 
 
@@ -4725,38 +5413,49 @@ def format_verification_evidence_block(code, filename_hint, fields):
         Code: <requirement code>
         Filename: <source document>
         Condition Met: <exact condition/sentence the document states>
-        Why It Passed: <plain-language reasoning>
-        Status: Pass / Fail / Not Determined
 
     "Condition Met" is the LLM's "Evidence" field (see
     parse_verification_evidence_fields() /
     VERIFICATION_EVIDENCE_PROMPT_TEXT) - the literal condition/sentence
     the document itself uses to state the requirement was satisfied.
-    "Status" is the normalized Pass/Fail/Not Determined verdict (see
-    _normalize_pass_fail_status()).
 
-    Falls back to the original Column E code/filename whenever the
-    LLM's own Code/Document fields come back blank or as a "nothing
-    found" placeholder, so the block is never emptier than what was
-    already known before the LLM call.
+    Falls back to the original Column E code whenever the LLM's own
+    Code field comes back blank or as a "nothing found" placeholder,
+    so the block is never emptier than what was already known before
+    the LLM call.
+
+    BUGFIX: Filename is now ALWAYS `filename_hint` - the document
+    find_verification_evidence_document() already resolved and queried
+    - and NEVER the LLM's own self-reported "Document:" field. The LLM
+    was being asked to name the document it was reading, but the
+    retrieved chunks it sees rarely state their own filename, so it
+    frequently answered with a placeholder like "[Document name not
+    provided in the prompt]" or "<document name not provided>" - and
+    since those exact phrasings weren't in is_meaningful_evidence_field()'s
+    blocklist, they were printed as-is instead of falling back (this is
+    why Column F showed "not provided" even though the real document
+    name was sitting right there in Column E). Worse, sometimes the LLM
+    would quote an unrelated name it found INSIDE the document's content
+    and mistake that for the document's own title (e.g. querying "vest
+    apx mcb module feature test result" but reporting the filename as
+    "VAR-SOM-MX7/VAR-SOM-MX7-5G SYSTEM ON MODULE", a module name merely
+    mentioned in that document's text) - a wrong answer that no
+    placeholder blocklist could ever catch. Since the correct document
+    was already resolved before this LLM call was made, there is no
+    reason to ask the LLM to re-identify it - filename_hint is the
+    ground truth in every case.
     """
     code_out = fields.get("code", "")
-    filename_out = fields.get("document", "")
     condition_out = fields.get("evidence", "")
-    why_out = fields.get("why_it_passed", "")
-    status_out = _normalize_pass_fail_status(fields.get("pass_status", ""))
 
     code_out = code_out if is_meaningful_evidence_field(code_out) else code
-    filename_out = filename_out if is_meaningful_evidence_field(filename_out) else (filename_hint or "None")
+    filename_out = filename_hint or "None"
     condition_out = condition_out if is_meaningful_evidence_field(condition_out) else "None"
-    why_out = why_out if is_meaningful_evidence_field(why_out) else "None"
 
     return (
         f"Code: {code_out}\n"
         f"Filename: {filename_out}\n"
-        f"Condition Met: {condition_out}\n"
-        f"Why It Passed: {why_out}\n"
-        f"Status: {status_out}"
+        f"Condition Met: {condition_out}"
     )
 
 
@@ -4764,25 +5463,21 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
     """
     CALL 8 - runs on the fully merged, traceability-resolved final_edos
     list (Existing + New), AFTER build_final_edos_with_traceability()
-    (CALL 7) has already rewritten each record's "verification_reference"
-    into its final per-code "<code> <location> - <filename>" trace lines
-    (plus the parallel "verification_reference_doc_numbers" list).
+    (CALL 7).
 
-    For each record, for every code/filename/doc_number triple recovered
-    from Column E (see parse_verification_reference_code_filename_pairs()),
-    resolves the source document (exact number match first, fuzzy
-    filename match as fallback - see find_verification_evidence_document()),
-    asks the Design Verification Traceability Analyst prompt to identify
-    that code's evidence and pass reason against exactly that matched
-    document, and writes a "Code / Filename / Why It Passed" block onto
-    the record. Multiple codes on one record produce multiple blocks, in
-    Column E's original order, separated by a blank line.
-
-    Writes the combined block text onto each record's
-    "verification_evidence" field (read by format_edo_worksheet() into
-    Column F). Records with no usable code/filename pair in Column E, or
-    for which no document resolves by either number or filename, are
-    left with Column F blank. Returns final_edos.
+    CHANGED: added a run-scoped success-only cache keyed by
+    (resolved_document_name, code). A code that appears in many EDO
+    records (e.g. SRS-CTRL-130 appearing in 10 different rows) is only
+    ever a genuine retrieval question ONCE - if it succeeds on ANY
+    occurrence, every other occurrence reuses that same correct answer
+    instead of re-rolling retrieval independently and risking a worse
+    result. A failed/empty result is NEVER cached, so later occurrences
+    of the same code keep trying instead of being locked into "None".
+    A one-time immediate retry is also added when the first attempt
+    comes back non-meaningful. After the main loop, a backfill pass
+    goes back over every record and replaces any remaining "None" block
+    whose (document, code) key was successfully resolved LATER in the
+    run - so earlier rows benefit from a success found afterwards too.
     """
     logging.info("=" * 80)
     logging.info("CALL 8: VERIFICATION EVIDENCE EXTRACTION (COLUMN F, POST-TRACEABILITY)")
@@ -4804,6 +5499,11 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
             "for every record."
         )
         return final_edos
+
+    # Run-scoped, SUCCESS-ONLY cache: (resolved_document_name, code) -> block.
+    # Never populated with a "None"/non-meaningful result - see the
+    # is_meaningful_evidence_field() guard below before writing to it.
+    evidence_cache = {}
 
     for edo in final_edos:
         code_filename_pairs = parse_verification_reference_code_filename_pairs(edo)
@@ -4833,21 +5533,49 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
                 )
                 continue
 
+            resolved_document_name = (
+                normalize_text(matched_document.get("document_name")) or filename_hint
+            )
+            cache_key = (resolved_document_name, normalize_id(code))
+
+            # ---- Cache hit: reuse a PRIOR SUCCESSFUL result, no LLM call ----
+            if cache_key in evidence_cache:
+                blocks.append(evidence_cache[cache_key])
+                logging.info(f"CALL 8: cache hit for {cache_key!r} - reused prior result.")
+                continue
+
             fields, raw_response = _query_verification_evidence_document(
                 pipeline_config, matched_document, code
             )
+
+            # ---- One immediate retry if the first pass came back empty ----
+            if not is_meaningful_evidence_field(fields.get("evidence", "")):
+                logging.info(
+                    f"CALL 8: first pass for {code!r} against "
+                    f"{resolved_document_name!r} returned no usable "
+                    "evidence - retrying once."
+                )
+                retry_fields, retry_raw = _query_verification_evidence_document(
+                    pipeline_config, matched_document, code
+                )
+                if is_meaningful_evidence_field(retry_fields.get("evidence", "")):
+                    fields, raw_response = retry_fields, retry_raw
 
             if not fields:
                 logging.warning(
                     f"CALL 8: code={code!r} matched document "
                     f"{matched_document.get('document_name')!r} but the LLM "
                     "response could not be parsed into any evidence fields "
-                    "(empty/malformed response, or a failed call) - this "
-                    "code's block will show 'None'/'Not Determined'. Raw "
+                    f"(empty/malformed response, or a failed call). Raw "
                     f"response: {raw_response!r}"
                 )
 
-            block = format_verification_evidence_block(code, filename_hint, fields)
+            block = format_verification_evidence_block(code, resolved_document_name, fields)
+
+            # ---- Only cache a REAL success - never cache "None" ----
+            if is_meaningful_evidence_field(fields.get("evidence", "")):
+                evidence_cache[cache_key] = block
+
             blocks.append(block)
 
             edo.setdefault("verification_evidence_raw_llm_responses", {})[code] = raw_response
@@ -4859,7 +5587,65 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
 
         edo["verification_evidence"] = "\n\n".join(blocks)
 
+    # ---- Backfill pass: fix earlier records whose code later succeeded ----
+    final_edos = backfill_evidence_from_cache(final_edos, evidence_cache, edo_document)
+
     print("Verification_Evidence (Column F):", final_edos)
+    return final_edos
+
+def backfill_evidence_from_cache(final_edos, evidence_cache, edo_document):
+    """
+    Second pass over final_edos, run once the main CALL 8 loop has
+    finished (and evidence_cache holds every SUCCESSFUL (document, code)
+    result found anywhere in the run - see extract_and_apply_verification_evidence()).
+
+    A record processed EARLY in the main loop may have gotten "None" for
+    a code that only succeeded later, on a DIFFERENT record's occurrence
+    of that same code. This pass finds every remaining "Condition Met:
+    None" block, re-derives its (document, code) cache key, and replaces
+    it with the now-known-good cached block if one exists - so success
+    found anywhere in the run benefits every occurrence, not just the
+    ones processed after it.
+    """
+    for edo in final_edos:
+        verification_evidence = edo.get("verification_evidence", "")
+        if not verification_evidence or "Condition Met: None" not in verification_evidence:
+            continue
+
+        pairs = parse_verification_reference_code_filename_pairs(edo)
+        if not pairs:
+            continue
+
+        blocks = verification_evidence.split("\n\n")
+        changed = False
+
+        for i, pair in enumerate(pairs):
+            if i >= len(blocks):
+                break
+            if "Condition Met: None" not in blocks[i]:
+                continue
+
+            matched_document = find_verification_evidence_document(
+                edo_document, pair["filename"], doc_number=pair.get("doc_number")
+            )
+            if not matched_document:
+                continue
+
+            doc_name = normalize_text(matched_document.get("document_name"))
+            cache_key = (doc_name, normalize_id(pair["code"]))
+
+            if cache_key in evidence_cache:
+                blocks[i] = evidence_cache[cache_key]
+                changed = True
+                logging.info(
+                    f"CALL 8 BACKFILL: replaced 'None' block for code "
+                    f"{pair['code']!r} on {edo.get('edo_tag') or edo.get('edo_id')!r} "
+                    "with a later-found successful result."
+                )
+
+        if changed:
+            edo["verification_evidence"] = "\n\n".join(blocks)
+
     return final_edos
 
 
@@ -5015,28 +5801,116 @@ def get_fmea_risk_evaluation(pipeline_config, edo_document, prompt_data, ra_numb
     return risk_evaluation_value.strip().lower()
 
 
+import re
+import logging
+
+
+def _norm_id(value):
+    """Normalize an RA/FMEA number for comparison (case/space/dash-insensitive)."""
+    return re.sub(r"[\s\-_]+", "", str(value or "")).upper()
+
+
+def get_document_ra_fmea_pairs(edo_document):
+    """
+    Returns the RA <-> FMEA pairs that actually exist in the source document as
+    a set of (normalized_ra, normalized_fmea) tuples.
+
+    ADAPT THIS to your document structure. Two common shapes are handled:
+      - a list of dict rows with "RA_Number" / "FMEA_Number" keys
+      - a dict with such rows under "ra_fmea_pairs" / "rows"
+    """
+    rows = []
+    if isinstance(edo_document, dict):
+        rows = (
+            edo_document.get("ra_fmea_pairs")
+            or edo_document.get("rows")
+            or []
+        )
+    elif isinstance(edo_document, (list, tuple)):
+        rows = edo_document
+
+    pairs = set()
+    for row in rows:
+        if isinstance(row, dict):
+            ra, fmea = row.get("RA_Number"), row.get("FMEA_Number")
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            ra, fmea = row[0], row[1]
+        else:
+            continue
+        if _norm_id(ra) and _norm_id(fmea):
+            pairs.add((_norm_id(ra), _norm_id(fmea)))
+    return pairs
+
+
+def check_ra_fmea_mismatch(edo_document, ra_number, fmea_number):
+    """
+    Checks the record's RA/FMEA pair against the actual document.
+    Applies to BOTH new and existing EDOs.
+
+    Returns a list of mismatch messages (empty list = everything matches or
+    nothing could be verified).
+    """
+    ra, fmea = _norm_id(ra_number), _norm_id(fmea_number)
+    if not ra or not fmea:
+        return []  # nothing to verify against
+
+    try:
+        doc_pairs = get_document_ra_fmea_pairs(edo_document)
+    except Exception as e:
+        logging.error(f"RA/FMEA pair lookup failed: {e}")
+        return []
+    if not doc_pairs:
+        return []  # can't verify -> don't fabricate an observation
+
+    doc_ras = {p[0] for p in doc_pairs}
+    doc_fmeas = {p[1] for p in doc_pairs}
+
+    issues = []
+    if ra not in doc_ras:
+        issues.append(f"RA number '{ra_number}' was not found in the document.")
+    if fmea not in doc_fmeas:
+        issues.append(f"FMEA number '{fmea_number}' was not found in the document.")
+    if ra in doc_ras and fmea in doc_fmeas and (ra, fmea) not in doc_pairs:
+        expected = sorted(f for r, f in doc_pairs if r == ra)
+        issues.append(
+            f"RA number '{ra_number}' and FMEA number '{fmea_number}' do not "
+            f"match as a pair in the document (document maps this RA to: "
+            f"{', '.join(expected)})."
+        )
+    return issues
+
+
 def generate_observation_text(pipeline_config, edo_document, prompt_data, ra_number, fmea_number):
     """
-    Column M "Observation" block.
+    Column M "Observation" block (applies to both New and Existing EDOs).
 
-    Looks up the Sys-FMEA Risk_Evaluation value for this record's
-    FMEA_Number:
-      - "Low"    -> returns the fixed observation sentence below.
-      - "Medium" -> returns "" (no text, no heading printed at all).
-      - anything else (High/blank/not found) -> returns "" as well.
+    Observation points, in order:
+      1. RA/FMEA pair mismatch vs. the actual document (only if found).
+      2. Sys-FMEA Risk_Evaluation == "Low" -> the fixed sentence below.
+
+    Returns "" (no text, no heading) when neither applies.
     """
-    risk_evaluation = get_fmea_risk_evaluation(
-        pipeline_config, edo_document, prompt_data, ra_number, fmea_number
-    )
+    points = []
 
+    # ---- 1. RA / FMEA mismatch check ----
+    for issue in check_ra_fmea_mismatch(edo_document, ra_number, fmea_number):
+        points.append(f"In the RA&C/Sys-FMEA mapping, {issue}")
+
+    # ---- 2. Existing Low-risk observation (text unchanged) ----
+    risk_evaluation = None
+    if prompt_data is not None:
+        risk_evaluation = get_fmea_risk_evaluation(
+            pipeline_config, edo_document, prompt_data, ra_number, fmea_number
+        )
     if risk_evaluation == "low":
-        return (
-            "Observation: In Sys-FMEA, the risk evaluation is 'Low'. "
+        points.append(
+            "In Sys-FMEA, the risk evaluation is 'Low'. "
             "recommended to change in the sys-FMEA as medium."
         )
 
-    return ""
-
+    if not points:
+        return ""
+    return "Observation: " + "\n".join(points)
 
 def generate_recommendation_text(edo, risk, pipeline_config):
     """
@@ -5154,9 +6028,9 @@ def generate_remarks_and_recommendation(
     if traceability_fail_remarks:
         fail_remarks_text = "\n".join(traceability_fail_remarks)
 
-    # ---- 3. Observation (Sys-FMEA Risk_Evaluation == "Low" only) ----
+    # ---- 3. Observation (RA/FMEA mismatch and/or Sys-FMEA "Low") ----
     observation_text = ""
-    if edo_document is not None and risk_eval_prompt_data is not None:
+    if edo_document is not None:
         observation_text = generate_observation_text(
             pipeline_config,
             edo_document,
@@ -5269,7 +6143,53 @@ def format_output_text(value):
     text = _capitalize_sentences(text)
     text = _normalize_document_codes(text)
     return text
+def build_column_d_reference(edo, edo_document):
+    """Build Column D from RA/FMEA numbers, their source document names, and trace."""
+    ra_number = normalize_text(edo.get("RA_Number", ""))
+    fmea_number = normalize_text(edo.get("FMEA_Number", ""))
 
+    has_ra = ra_number not in ("", "Blank", "None")
+    has_fmea = fmea_number not in ("", "Blank", "None")
+
+    ra_document = edo_document.get("edo_ra_c", {}) or {}
+    fmea_document = edo_document.get("edo_fmea", {}) or {}
+
+    ra_doc_name = normalize_text(
+        ra_document.get("document_name")
+        or ra_document.get("originalfilename")
+        or ra_document.get("filename")
+    )
+    fmea_doc_name = normalize_text(
+        fmea_document.get("document_name")
+        or fmea_document.get("originalfilename")
+        or fmea_document.get("filename")
+    )
+
+    reference_lines = []
+
+    if has_ra:
+        reference_lines.append(
+            f" {ra_number}"
+            + (f" |  {ra_doc_name}" if ra_doc_name else "")
+        )
+
+    if has_fmea:
+        reference_lines.append(
+            f" {fmea_number}"
+            + (f" |  {fmea_doc_name}" if fmea_doc_name else "")
+        )
+
+    # NOTE: the trace itself is intentionally NOT appended here anymore.
+    # It used to be added to reference_lines whenever both RA_Number and
+    # FMEA_Number were present, but format_edo_worksheet() ALSO appends
+    # the same "existing_trace" value as a separate red TextBlock on top
+    # of this function's return value (see the CellRichText block built
+    # around existing_trace_value) - so the trace was being printed
+    # TWICE in Column D: once here as plain black text, and once again
+    # in red right after it. The red TextBlock append is the only place
+    # the trace should be added, so it's no longer duplicated here.
+
+    return "\n".join(reference_lines)
 
 def format_edo_tag_text(value):
     """
@@ -5526,10 +6446,8 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
                         col_i_value = "None"
 
 
-            col_d_value = format_output_text(edo.get("dfmea"))
-            existing_trace_value = ""
-            if not is_new:
-                existing_trace_value = format_output_text(edo.get("existing_trace"))
+            col_d_value = build_column_d_reference(edo, edo_document)
+            existing_trace_value = format_output_text(edo.get("existing_trace"))
 
             logging.info(f"{key} dfmea raw: {edo.get('dfmea')}")
             logging.info(f"{key} existing_trace raw: {edo.get('existing_trace')}")
@@ -5569,7 +6487,7 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             apply_risk_cell_style(sheet.cell(current_row, 12), risk)
 
-            if not is_new and existing_trace_value:
+            if existing_trace_value:
                 d_cell = sheet.cell(current_row, 4)
                 base_font = InlineFont(color=BLACK, rFont="Calibri", sz=10)
                 trace_font = InlineFont(color=RED, rFont="Calibri", sz=10)
@@ -5705,7 +6623,7 @@ def generate_edo_template(
     logging.info("=" * 80)
     logging.info("STARTING COMPLETE EDO TEMPLATE GENERATION PIPELINE (MERGED)")
     logging.info("=" * 80)
-
+    logging.info(f"[RUN] template={templatename} product={product} — watch [COUNT] lines below for New EDO fluctuation across runs")
     try:
         # ---------------------------------------------------
         # Load all documents from the database first
@@ -5831,6 +6749,37 @@ def generate_edo_template(
             db
         )
         print(f"extract_new_edo_summary_details: ", edo_new_data)
+
+        # ---------------------------------------------------
+        # CALL 5B: Extract New EDO trace details - same call, prompt,
+        # and question as CALL 3 (extract_existing_edo_trace_details),
+        # but a New EDO has no per-record EDO tag of its own, so the
+        # fixed literal "EDO-XX New" is used as the tag instead.
+        # ---------------------------------------------------
+        try:
+            new_trace_details = extract_new_edo_trace_details(
+                client,
+                product_family,
+                product,
+                templatename,
+                pipeline_config,
+                edo_document,
+                edo_new_data,
+                db
+            )
+
+            edo_new_data = apply_new_edo_trace(
+                edo_new_data,
+                new_trace_details
+            )
+        except Exception as new_trace_error:
+            logging.warning(
+                "CALL 5B SKIPPED - New EDO trace extraction failed, "
+                "leaving the trace part of column D blank for New EDO "
+                f"records this run. Reason: {new_trace_error}"
+            )
+
+        print(f"extract_new_edo_trace_details: ", edo_new_data)
 
         new_records = list(edo_new_data.values())
 
