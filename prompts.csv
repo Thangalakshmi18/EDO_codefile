@@ -32211,6 +32211,8 @@ INSTRUCTIONS:
      Combine all extracted tags into a single comma-separated list, e.g.: ""MS CU Mod-339, DRS-570, DRS-774, MS CU Mod-353, SRS-CTRL-370""
      If no tags are found at all, write ""None"".
    - Risk_Status: get the ""Prior to Risk Control"" Risk evaluation value
+    - CP: extracted CP value from the table and trim ""No""
+    -Traceability: get from document on under the following heading ""Trace(s) to Module DFMEA risk controls: Document#, Tag#; cause  "" 
 3. Ignore if Prior to Risk Control Risk evaluation = Low & Not Reasonably Foreseeable
 
 OUTPUT REQUIREMENT:
@@ -32225,11 +32227,12 @@ Return STRICTLY a JSON array matching this exact structure. Do NOT wrap in markd
     ""Status"": ""New EDO"",
     ""Product_Feature_Function"": ""<Extracted Failure Mode>"",
     ""Reason_Identified_as_EDO"": ""<Cause>\n\nA failure in the system may cause the following sequence of events: <FSE> This leads to the hazardous situation of <Hazardous Situation>, resulting in potential harm: <Harm>"",
-    ""Traceability"": ""NPD36702 Vest APX Risk Assessment and Control\n{ra_number}\nNPD36706 Vest APX System FMEA\n{fmea_number}"",
     ""Verification_Reference"": ""<comma-separated list of all tags or None>"",
+    ""Traceability"":""<Extracted new edo trace>"",
     ""EDO_Location"": ""None"",
     ""EDO_Description"": ""None"",
-    ""Reason_Identified_as_EDO_ColH"": ""None""
+    ""Reason_Identified_as_EDO_ColH"": ""None"",
+    ""Project_code"":""<extracted cp>""
   }
 ]",NULL,"You are a helpful assistant that extracts specific information from the provided context.","Essential_Design_Output_Template_QS00"
 1765,"Baxter","Vest APX","Vest APX",NULL,"EDO_NEW_Verification_details","From the matching record, extract all verification tags (e.g., DRS-xxx, MS CU Mod-xxx, MS ACC Mod-xxx, SRS-CTRL-xxx) found across both of the following columns:
@@ -32889,6 +32892,8 @@ INSTRUCTIONS:
      Combine all extracted tags into a single comma-separated list, e.g.: ""MS CU Mod-339, DRS-570, DRS-774, MS CU Mod-353, SRS-CTRL-370""
      If no tags are found at all, write ""None"".
    - Risk_Status: get the ""Prior to Risk Control"" Risk evaluation value
+    - CP: extracted CP value from the table and trim ""No""
+    -Traceability: get from document on under the following heading ""Trace(s) to Module DFMEA risk controls: Document#, Tag#; cause  "" 
 3. Ignore if Prior to Risk Control Risk evaluation = Low & Not Reasonably Foreseeable
 
 OUTPUT REQUIREMENT:
@@ -32903,11 +32908,12 @@ Return STRICTLY a JSON array matching this exact structure. Do NOT wrap in markd
     ""Status"": ""New EDO"",
     ""Product_Feature_Function"": ""<Extracted Failure Mode>"",
     ""Reason_Identified_as_EDO"": ""<Cause>\n\nA failure in the system may cause the following sequence of events: <FSE> This leads to the hazardous situation of <Hazardous Situation>, resulting in potential harm: <Harm>"",
-    ""Traceability"": ""NPD36702 Vest APX Risk Assessment and Control\n{ra_number}\nNPD36706 Vest APX System FMEA\n{fmea_number}"",
     ""Verification_Reference"": ""<comma-separated list of all tags or None>"",
+    ""Traceability"":""<Extracted new edo trace>"",
     ""EDO_Location"": ""None"",
     ""EDO_Description"": ""None"",
-    ""Reason_Identified_as_EDO_ColH"": ""None""
+    ""Reason_Identified_as_EDO_ColH"": ""None"",
+    ""Project_code"":""<extracted cp>""
   }
 ]","2026-09-08 14:52:19.413561","You are a helpful assistant that extracts specific information from the provided context.","Essential_Design_Output_Template_QS00"
 1923,"Baxter","Volara - Maximus - Synclara","Volara",NULL,"EDO_NEW_Verification_details","From the matching record, extract all verification tags (e.g., DRS-xxx, MS CU Mod-xxx, MS ACC Mod-xxx, SRS-CTRL-xxx) found across both of the following columns:
