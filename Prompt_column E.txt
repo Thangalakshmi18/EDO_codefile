@@ -1,0 +1,65 @@
+
+
+
+Question: Extract EVERY matching current record for each specific code: DRS-846.
+        Do not return only one record when a REQ TAG has multiple Current rows.
+
+Full text: Yes
+CP: Question
+Prompt:
+Get the latest revision record for each requirement and ignore all older revisions.
+Get column B.
+extract the specific details for the code don't get extra records
+When determining the latest revision record, refer to the value in Column B (REQ DOC REV)
+If multiple rows exist for the same requirement, consider the row with the biggest/highest revision number in Column B as the latest revision. For example, if row 1 has a revision number of 2 and row 2 has a revision number of 1, use the value from row 1. don't extract rest record
+
+Return ONLY a valid JSON array. No explanations, no Markdown, no code fences, and no text outside the JSON.
+
+Use EXACTLY these field names and structure:
+
+[
+{
+"req_tag": "XXX-XXX",
+"vv_record_file_name": "<extracted file name>",
+"vv_record_location": "<extracted location name>",
+"req_result": "pass",
+"record status": "<extracted record status>"
+}
+]
+
+Do not add, remove, or rename any fields. Return only the latest revision record for each requirement.
+
+CALL 7 TRACEABILITY EXTRACTION CONTRACT - MANDATORY:
+Return every Current JSON row for every matching requested REQ TAG. A REQ
+TAG may have multiple Current rows; return all of them so code can compare
+V/V RECORD LOCATION revisions. Never select a row yourself.
+For EACH returned row, include ALL of these keys, even when the source
+cell is blank:
+- req_tag
+- vv_record_file_name
+- vv_record_location
+- req_result
+- issue
+- Project_ID
+- Record_Status
+- req_doc_rev
+
+SOURCE-COLUMN MAPPING (do not omit these):
+- Project_ID = exact value from the source column headed
+  'PROJECT ID (PRJ # for NPD) (SUS # for Sustaining)'.
+- Record_Status = exact value from the source column headed
+  'RECORD STATUS'.
+- vv_record_file_name = exact value from 'V/V RECORD FILE NAME'.
+- vv_record_location = exact value from 'V/V RECORD LOCATION'.
+- req_result = exact value from 'REQ RESULT (PASS/FAIL)'.
+- issue = exact value from 'ISSUE'.
+- req_doc_rev = exact value from 'REQ DOC REV'.
+
+Do NOT infer Project_ID from the query's Project code. Read it from the
+matched source row. If the source row has no Project_ID, return an empty
+string for Project_ID; do not invent one. Likewise return an empty string
+for Record_Status when the source cell is absent/blank.
+
+The requested Project code is PRJ6108286. It is a DISAMBIGUATION
+VALUE ONLY and must not be copied into Project_ID unless that exact value
+appears in the matched source row's PROJECT ID column.

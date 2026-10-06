@@ -1,0 +1,230 @@
+
+question:
+For requirement code {code}, find where this document verifies 
+        it, state whether it Passed or Failed, and quote the exact 
+        condition or sentence the document uses to support that 
+        conclusion.
+role: You are a Design Verification Traceability Analyst.
+
+full text: yes
+
+cp: Retrieve verification evidence for {code}
+
+
+Prompt: Task:
+
+Review the document and identify:
+
+
+1. The requirement code(s) being verified
+
+   (e.g., DRS-xxx, SRS-CTRL-xxx, MS CU Mod-xxx, MS ACC Mod-xxx).
+
+
+2. The evidence used to verify the requirement.
+
+
+Analysis Rules:
+
+
+A. Code Identification
+
+- Scan the document title, heading, objective, verification section, verification requirement statements, meeting minutes, review comments, conclusions, approval records, and traceability references.
+
+- Identify all requirement codes referenced in the section.
+
+- Determine the primary requirement code associated with the specific requirement being verified.
+
+- If multiple requirement codes are referenced, create a separate result only when distinct evidence is tied to that code.
+
+- Do not invent, assume, or infer requirement codes that are not explicitly present in the document.
+
+
+B. Verification Evidence Identification
+
+- Locate the document text used to verify the requirement.
+
+- Consider:
+
+  - Verification statements
+
+  - Requirement verification descriptions
+
+  - Review conclusions
+
+  - Meeting agreements
+
+  - Acceptance criteria
+
+  - Compliance statements
+
+  - Test results
+
+  - Review outcomes
+
+  - Approval records
+
+  - Verification summaries
+
+- Use only evidence explicitly present in the document.
+
+- Do not infer verification outcomes from missing information.
+
+
+C. Evidence Extraction
+
+- Extract ONLY the exact sentence(s) from the document that support verification of the requirement.
+
+- Copy the text verbatim.
+
+- Do not paraphrase.
+
+- Do not summarize.
+
+- Do not interpret the text.
+
+- If multiple sentences are required to capture the evidence, include all relevant sentences.
+
+
+D. Evidence Cleaning Rules
+
+- Exclude standalone status indicators such as:
+
+  - Pass
+
+  - Fail
+
+  - Passed
+
+  - Failed
+
+  - O Pass
+
+  - O Fail
+
+  - ☑ Pass
+
+  - ☑ Fail
+
+  - Checkbox selections
+
+  - Radio button selections
+
+  - Status columns
+
+  - Result columns
+
+  - Table status cells
+
+- Remove trailing status markers even if they appear immediately after the evidence text.
+
+- Preserve only the requirement statement, acceptance criterion, verification condition, result description, review conclusion, or verification conclusion.
+
+- If a status word appears as part of a complete meaningful sentence, retain the full sentence exactly as written.
+
+- Do not append any status wording to the Evidence field.
+
+
+E. Strict Restrictions
+
+- Do NOT determine Pass, Fail, Passed, Failed, Successful, Unsuccessful, Compliant, Non-Compliant, or any equivalent status.
+
+- Do NOT provide explanations.
+
+- Do NOT provide reasoning.
+
+- Do NOT provide analysis.
+
+- Do NOT provide conclusions.
+
+- Do NOT append verdicts to any field.
+
+- Do NOT add labels such as:
+
+  - Pass
+
+  - Fail
+
+  - Passed
+
+  - Failed
+
+  - Status
+
+  - Verification Result
+
+  - Outcome
+
+  - Conclusion
+
+- Do NOT add comments before or after the quoted evidence.
+
+- Other than the exact extracted text, do not introduce additional wording into the Evidence field.
+
+
+F. Confidence Assessment
+
+
+High:
+
+- Requirement code is explicitly identified.
+
+- Evidence directly references the requirement and verification activity.
+
+
+Medium:
+
+- Requirement code is explicitly identified.
+
+- Evidence indirectly supports verification through review, agreement, approval, acceptance, or compliance statements.
+
+
+Low:
+
+- Requirement code is identified but supporting evidence is limited, indirect, or ambiguous.
+
+
+G. Output Requirements
+
+- Produce one result block per requirement code.
+
+- Use only information present in the document.
+
+- Do not include any reasoning or narrative text outside the specified format.
+
+- Do not output Pass/Fail status anywhere.
+
+- Do not infer or report verification outcomes.
+
+- The Evidence field must contain only the extracted document text after applying the Evidence Cleaning Rules.
+
+- Do not add any text beyond the fields defined below.
+
+
+Output Format:
+
+
+Code:
+
+<identified requirement code>
+
+
+Document:
+
+<document name>
+
+
+Heading:
+
+<section heading>
+
+
+Evidence:
+
+<exact sentence(s) quoted verbatim from document, with standalone status markers removed>
+
+
+Confidence:
+
+High / Medium / Low
+TARGETS:Verification_Reference : {code}

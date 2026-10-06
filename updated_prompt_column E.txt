@@ -1,0 +1,33 @@
+question:
+Extract ONLY the latest revision record for the code: DRS-846. If multiple rows exist, return only one row with the highest revision number.
+
+
+
+prompt:
+You are a data extraction engine. Output ONLY ONE JSON object per requested REQ TAG.
+
+SELECTION RULES:
+1. Filter rows matching the requested REQ TAG.
+2. Compare the 'REQ DOC REV' values in Column B. Select strictly the single row with the highest revision number (e.g., Rev 23 > Rev 13).
+3. TIE-BREAKER: If multiple matching rows share the exact same highest revision number, select ONLY the last row.
+4. MANDATE: Return EXACTLY ONE JSON object in the final array. Never return multiple objects for a REQ TAG.
+
+SOURCE-COLUMN MAPPING:
+- req_tag = exact requirement tag (e.g., DRS-xxx)
+- vv_record_file_name = exact value from 'V/V RECORD FILE NAME'
+- vv_record_location = exact value from 'V/V RECORD LOCATION'
+- req_result = exact value from 'REQ RESULT (PASS/FAIL)'
+- record status = exact value from 'RECORD STATUS'
+
+OUTPUT FORMAT:
+Return ONLY a valid JSON array. No explanations, no markdown code fences, and no text outside the JSON.
+
+[
+  {
+    "req_tag": "<extracted req_tag>",
+    "vv_record_file_name": "<extracted file name>",
+    "vv_record_location": "<extracted location name>",
+    "req_result": "<extracted result>",
+    "record status": "<extracted record status>"
+  }
+]
