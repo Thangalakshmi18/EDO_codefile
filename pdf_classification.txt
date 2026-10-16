@@ -1,0 +1,98 @@
+import os
+import shutil
+import fitz  # PyMuPDF library
+from pathlib import Path
+
+def organize_files(source_folder, destination_folder):
+    # Convert paths to Path objects for easier handling
+    src_path = Path(source_folder)
+    dest_path = Path(destination_folder)
+
+    # Define subfolders for categorization
+    categories = {
+        'scanned_pdfs': dest_path / 'Scanned_PDFs',
+        'text_pdfs': dest_path / 'Text_PDFs',
+        'word_docs': dest_path / 'Word_Documents',
+        'excel_files': dest_path / 'Excel_Files',
+        'others': dest_path / 'Others'
+    }
+
+    # Create the destination folders if they don't exist
+    for folder in categories.values():
+        folder.mkdir(parents=True, exist_ok=True)
+
+    # Iterate through all files in the source folder
+    for file_path in src_path.iterdir():
+        if not file_path.is_file():
+            continue  # Skip directories
+
+        filename = file_path.name
+        extension = file_path.suffix.lower()
+        target_folder = categories['others'] # Default fallback
+
+        if extension == '.pdf':
+            try:
+                # Open the PDF using PyMuPDF
+                doc = fitz.open(file_path)
+                
+                image_count = 0
+                text_content = ""
+                
+                # Count images and extract text from all pages
+                for page in doc:
+                    image_count += len(page.get_images(full=True)) 
+                    text_content += page.get_text()
+                
+                doc.close()
+
+                # Count the number of words in the extracted text
+                # .split() automatically handles spaces, tabs, and newlines
+                word_count = len(text_content.split())
+
+                # --- UPDATED CLASSIFICATION LOGIC ---
+                
+                # Rule 1 (NEW): If it has more than 100 words, it is TEXT-BASED 
+                # (This overrides the image count rule)
+                if word_count > 100:
+                    target_folder = categories['text_pdfs']
+                    
+                # Rule 2: If it has more than 3 images (but <= 100 words), it is SCANNED
+                elif image_count > 3:
+                    target_folder = categories['scanned_pdfs']
+                    
+                # Rule 3: If it has 1 to 3 images and <= 100 words, it's likely a short SCANNED doc
+                elif image_count > 0 and word_count <= 100:
+                    target_folder = categories['scanned_pdfs']
+                    
+                # Rule 4: Default fallback (e.g., text PDFs with 0-3 images and <= 100 words)
+                else:
+                    target_folder = categories['text_pdfs']
+                    
+            except Exception as e:
+                print(f"Error reading PDF {filename}: {e}")
+                target_folder = categories['others']
+
+        elif extension in ['.doc', '.docx']:
+            target_folder = categories['word_docs']
+
+        elif extension in ['.xls', '.xlsx', '.csv']:
+            target_folder = categories['excel_files']
+
+        # Move the file to the determined folder 
+        # (Change shutil.move to shutil.copy2 if you want to keep the original files)
+        shutil.move(str(file_path), str(target_folder / filename))
+        print(f"Moved: {filename} -> {target_folder.name}")
+
+    print("\nFile organization complete!")
+
+# --- CONFIGURATION ---
+# Change these paths to your actual folders
+SOURCE_DIR = './my_unorganized_files'      # Folder containing the mixed files
+DEST_DIR = './organized_files'             # Folder where categorized subfolders will be created
+
+if __name__ == "__main__":
+    # Ensure source directory exists before running
+    if not os.path.exists(SOURCE_DIR):
+        print(f"Error: Source folder '{SOURCE_DIR}' does not exist.")
+    else:
+        organize_files(SOURCE_DIR, DEST_DIR)
