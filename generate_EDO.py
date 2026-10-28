@@ -12,6 +12,7 @@ import tempfile
 import hashlib
 import math
 import threading
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import openpyxl
 import fitz
@@ -30,6 +31,7 @@ from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
 from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.utils.units import pixels_to_EMU
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 from Files.database import DatabaseHandler
 from retrieval.retrieve_content_prompt import retrieve_content_for_prompt
@@ -119,7 +121,7 @@ TARGET_IMAGE_FMEA_NUMBER = "FMEA Sys-152"
 # resolvable), and by CALL 7 / CALL 8 to key a verification code's
 # source document by its NPD number instead of by fuzzy filename text.
 
-DOC_NUMBER_PATTERN = re.compile(r'\bNPD\d+\b', re.IGNORECASE)
+DOC_NUMBER_PATTERN = re.compile(r'(?<![A-Za-z0-9])NPD\d+(?!\d)', re.IGNORECASE)
 
 
 def _extract_doc_number(value):
@@ -1476,6 +1478,192 @@ def blank(value):
     return text
 
 
+# ==========================================================
+# LLM DEBUG LOG  ->  written to its own tab ("LLM_Debug") in the output Excel
+# ==========================================================
+# Every retrieval+LLM query (execute_llm_retry) and every direct LLM call
+# (call_llm) is recorded here: stage, question, filters, prompt, the INPUT
+# CONTEXT (retrieved chunks) and the raw LLM RESPONSE. Thread-safe because
+# CALL 7 / CALL 8 run in a ThreadPoolExecutor. Disable with
+# pipeline_config["llm_debug_tab"] = False.
+LLM_DEBUG_SHEET_NAME = "LLM_Debug"
+LLM_DEBUG_CELL_LIMIT = 32000          # Excel max is 32767 chars per cell
+LLM_DEBUG_CONTEXT_PARTS = 4           # context split across up to N columns
+LLM_DEBUG_RESPONSE_PARTS = 2
+_LLM_DEBUG_LOG = []
+_LLM_DEBUG_LOCK = threading.Lock()
+_LLM_DEBUG_SKIP_FRAMES = {
+    "execute_llm_retry", "execute_llm", "execute_prompt", "call_llm",
+    "_record_llm_interaction", "_llm_debug_stage", "<lambda>", "run",
+    "_worker", "submit", "_bootstrap_inner", "_bootstrap",
+}
+
+
+def _llm_debug_stage():
+    """Name of the pipeline function that triggered this LLM query."""
+    try:
+        frame = sys._getframe(2)
+        while frame is not None:
+            name = frame.f_code.co_name
+            if name not in _LLM_DEBUG_SKIP_FRAMES:
+                return name
+            frame = frame.f_back
+    except Exception:
+        pass
+    return ""
+
+
+def _llm_debug_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for i, item in enumerate(value, 1):
+            parts.append(f"----- chunk {i} -----\n{item if isinstance(item, str) else json.dumps(item, default=str, ensure_ascii=False)}")
+        return "\n".join(parts)
+    if isinstance(value, (dict, set)):
+        try:
+            return json.dumps(value, default=str, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _record_llm_interaction(prompt_row, collection, docs, metadata, response, attempt=1, error="", stage=None):
+    try:
+        entry = {
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stage": stage or _llm_debug_stage(),
+            "attempt": attempt,
+            "collection": str(getattr(collection, "name", collection) or ""),
+            "question": _llm_debug_text((prompt_row or {}).get("question")),
+            "where_document": _llm_debug_text((prompt_row or {}).get("where_document")),
+            "where_filter": _llm_debug_text((prompt_row or {}).get("where_filter")),
+            "max_results": _llm_debug_text((prompt_row or {}).get("max_results")),
+            "prompt_role": _llm_debug_text((prompt_row or {}).get("prompt_role")),
+            "prompt_text": _llm_debug_text((prompt_row or {}).get("prompt_text")),
+            "num_chunks": len(docs) if isinstance(docs, (list, tuple)) else "",
+            "context": _llm_debug_text(docs),
+            "metadata": _llm_debug_text(metadata),
+            "response": _llm_debug_text(response),
+            "error": error,
+        }
+        with _LLM_DEBUG_LOCK:
+            entry["id"] = len(_LLM_DEBUG_LOG) + 1
+            _LLM_DEBUG_LOG.append(entry)
+    except Exception:
+        logging.exception("Could not record LLM debug entry")
+
+
+def _debug_cell_text(value):
+    text = ILLEGAL_CHARACTERS_RE.sub("", _text(value)) if value else ""
+    return text
+
+
+def _split_for_cells(text, parts):
+    text = _debug_cell_text(text)
+    chunks = [text[i:i + LLM_DEBUG_CELL_LIMIT] for i in range(0, len(text), LLM_DEBUG_CELL_LIMIT)] or [""]
+    if len(chunks) > parts:
+        omitted = sum(len(c) for c in chunks[parts:])
+        chunks = chunks[:parts]
+        chunks[-1] += f"\n...[TRUNCATED {omitted} more chars]"
+    return chunks + [""] * (parts - len(chunks))
+
+
+def write_llm_debug_sheet(workbook, pipeline_config=None):
+    """Adds/refreshes the LLM_Debug tab with every query's input context + response."""
+    if pipeline_config is not None and not _pipeline_flag(pipeline_config, "llm_debug_tab", True):
+        return
+    if LLM_DEBUG_SHEET_NAME in workbook.sheetnames:
+        del workbook[LLM_DEBUG_SHEET_NAME]
+    ws = workbook.create_sheet(LLM_DEBUG_SHEET_NAME)
+
+    headers = ["#", "Time", "Stage (function)", "Attempt", "Collection", "Question",
+               "where_document", "where_filter", "max_results", "Prompt role",
+               "Prompt text", "No. of chunks"]
+    headers += [f"Input context (part {i})" for i in range(1, LLM_DEBUG_CONTEXT_PARTS + 1)]
+    headers += ["Chunk metadata"]
+    headers += [f"LLM response (part {i})" for i in range(1, LLM_DEBUG_RESPONSE_PARTS + 1)]
+    headers += ["Error"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, name="Calibri", size=10)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+
+    with _LLM_DEBUG_LOCK:
+        entries = sorted(_LLM_DEBUG_LOG, key=lambda e: e["id"])
+
+    for e in entries:
+        row = [e["id"], e["time"], e["stage"], e["attempt"], e["collection"],
+               _split_for_cells(e["question"], 1)[0],
+               _split_for_cells(e["where_document"], 1)[0],
+               _split_for_cells(e["where_filter"], 1)[0],
+               e["max_results"], _split_for_cells(e["prompt_role"], 1)[0],
+               _split_for_cells(e["prompt_text"], 1)[0], e["num_chunks"]]
+        row += _split_for_cells(e["context"], LLM_DEBUG_CONTEXT_PARTS)
+        row += _split_for_cells(e["metadata"], 1)
+        row += _split_for_cells(e["response"], LLM_DEBUG_RESPONSE_PARTS)
+        row += [_debug_cell_text(e["error"])]
+        ws.append(row)
+
+    widths = {1: 6, 2: 19, 3: 30, 4: 8, 5: 22, 6: 45, 7: 25, 8: 15, 9: 10, 10: 25, 11: 50, 12: 10}
+    for col in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = widths.get(col, 60)
+    for r in ws.iter_rows(min_row=2):
+        for c in r:
+            c.alignment = Alignment(wrap_text=False, vertical="top")
+        ws.row_dimensions[r[0].row].height = 30
+
+
+# ==========================================================
+# TRACE DEBUG LOG -> "TRACE_DEBUG" tab: WHY each Column E/F code resolved or N/A
+# ==========================================================
+TRACE_DEBUG_SHEET_NAME = "TRACE_DEBUG"
+_TRACE_DEBUG_LOG = []
+_TRACE_DEBUG_LOCK = threading.Lock()
+
+
+def _record_trace_debug(edo_tag, ra, fmea, code, prefix, routed_doc, outcome,
+                        status="", location="", filename="", result="", source_doc=""):
+    try:
+        with _TRACE_DEBUG_LOCK:
+            _TRACE_DEBUG_LOG.append({
+                "id": len(_TRACE_DEBUG_LOG) + 1, "edo": edo_tag, "ra": ra, "fmea": fmea,
+                "code": code, "prefix": prefix, "routed_doc": routed_doc,
+                "outcome": outcome, "status": status, "location": location,
+                "filename": filename, "result": result, "source_doc": source_doc,
+            })
+    except Exception:
+        logging.exception("Could not record trace debug entry")
+
+
+def write_trace_debug_sheet(workbook, pipeline_config=None):
+    if LLM_DEBUG_SHEET_NAME and pipeline_config is not None and not _pipeline_flag(pipeline_config, "llm_debug_tab", True):
+        return
+    if TRACE_DEBUG_SHEET_NAME in workbook.sheetnames:
+        del workbook[TRACE_DEBUG_SHEET_NAME]
+    ws = workbook.create_sheet(TRACE_DEBUG_SHEET_NAME)
+    headers = ["#", "EDO", "RA", "FMEA", "Verification code", "Prefix hint",
+               "Routed document (prefix map)", "OUTCOME (why Column E shows what it shows)",
+               "Record status found", "V/V record location", "V/V record file name",
+               "Req result", "Source traceability document"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, name="Calibri", size=10)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    with _TRACE_DEBUG_LOCK:
+        entries = sorted(_TRACE_DEBUG_LOG, key=lambda e: e["id"])
+    for e in entries:
+        ws.append([_debug_cell_text(v) if isinstance(v, str) else v for v in (
+            e["id"], e["edo"], e["ra"], e["fmea"], e["code"], e["prefix"], e["routed_doc"],
+            e["outcome"], e["status"], e["location"], e["filename"], e["result"], e["source_doc"])])
+    for col, width in enumerate([6, 14, 12, 14, 22, 16, 32, 60, 16, 32, 40, 12, 36], 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.auto_filter.ref = ws.dimensions
+
+
 def call_llm(prompt, pipeline_config, question="generate content"):
     # NOTE: `question` used to be hardcoded to "risk classification"
     # here regardless of what the prompt actually asked for. That mislabel
@@ -1495,9 +1683,17 @@ def call_llm(prompt, pipeline_config, question="generate content"):
             temperature=pipeline_config["temperature"],
             max_tokens=pipeline_config["max_tokens"]
         )
+        _record_llm_interaction(
+            {"question": question, "prompt_text": prompt, "prompt_role": "(direct call_llm)"},
+            "(no retrieval)", None, None, response, 1, ""
+        )
         pass
         return response
     except Exception as e:
+        _record_llm_interaction(
+            {"question": question, "prompt_text": prompt, "prompt_role": "(direct call_llm)"},
+            "(no retrieval)", None, None, "", 1, f"ERROR: {e}"
+        )
         # NOTE: previously returned the literal string "No" here. That
         # sentinel was indistinguishable from a genuine (wrong) LLM
         # answer, so callers such as generate_remarks_and_recommendation()
@@ -1581,12 +1777,15 @@ def execute_llm_retry(
                 prompt_row
             )
 
+            _record_llm_interaction(prompt_row, collection, docs, metadata, response, attempt + 1, "" if response else "EMPTY RESPONSE")
+
             if response:
                 return docs, metadata, response
 
         except Exception as ex:
 
             last_exception = ex
+            _record_llm_interaction(prompt_row, collection, None, None, "", attempt + 1, f"ERROR: {ex}")
 
             pass
 
@@ -2224,7 +2423,11 @@ def extract_existing_edo_trace_details(
 
 TRACE OUTPUT CONTRACT:
 For the matched FMEA row only, return JSON in exactly this form:
-{"traces": ["<Document#>; <Tag#>", "<Document#>; <Tag#>"]}
+{"RA_Number": "<RA-###>", "traces": ["<Document#>; <Tag#>", "<Document#>; <Tag#>"]}
+
+"RA_Number" is the RA / RAC identifier ("Trace To RAC#") recorded in that
+same exact FMEA row of the FMEA document. Return it exactly as the FMEA
+document shows it. If the row has no RA identifier, return "RA_Number": "".
 
 Read the field headed "Trace(s) to Module DFMEA risk controls: Document#,
 Tag#; Cause" from the record whose FMEA heading EXACTLY equals the target
@@ -2233,8 +2436,9 @@ CU_Mod-### and FMEA ACC_Mod-###, as well as supported MRS FMEA tags. Treat
 the source spelling "FMRA CU_Mod-###" as FMEA CU_Mod-###. For
 FMEA CU_Mod/FMEA ACC_Mod entries, return the document number and tag only;
 omit the Cause text. Preserve the source tag spelling, including underscores.
-If that exact FMEA row is absent, return {"traces": []}. Do not substitute a
-different FMEA row. Do not return RA references, PFMEA entries, neighboring-
+If that exact FMEA row is absent, return {"RA_Number": "", "traces": []}. Do
+not substitute a different FMEA row. Do not put RA references inside "traces"
+(the RA goes only in "RA_Number"); do not return PFMEA entries, neighboring-
 row values, or text from other FMEA rows.
 """
 
@@ -2255,9 +2459,12 @@ row values, or text from other FMEA rows.
         if trace_cache_key in trace_result_cache:
             results[edo_tag] = dict(trace_result_cache[trace_cache_key])
             continue
+        # The old (EDO-document) RA is intentionally NOT given to the LLM:
+        # supplying it makes the model echo that RA even when the FMEA row
+        # is actually linked to a different RA. The FMEA number alone selects
+        # the row, and the RA the FMEA document reports is read back from it.
         target = (
             f"EDO : {edo_tag}\n"
-            f"RA_Number : {ra_number}\n"
             f"FMEA_Number : {trace_fmea_number}"
         )
 
@@ -2359,6 +2566,32 @@ def parse_custom_fmea_format(response):
 
     return traces
 
+_TRACE_RA_KEYS = (
+    "RA_Number", "RA Number", "ra_number", "ra_num",
+    "Trace To RAC#", "Trace_To_RAC"
+)
+
+
+def _extract_trace_ra_number(obj):
+    """RA_Number from a parsed CALL 3 JSON object, as canonical RA-###."""
+    if not isinstance(obj, dict):
+        return ""
+    return canonical_ra_id(get_llm_value(obj, *_TRACE_RA_KEYS))
+
+
+def _extract_trace_ra_number_from_text(text):
+    """RA_Number from a non-JSON CALL 3 response (custom / markdown text)."""
+    text = normalize_text(text)
+    for pattern in (
+        r"RA[_\s]*Number[\"']?\s*[:=]\s*[\"']?\s*(RA[\s\-:#]*\d+)",
+        r"Trace\s*To\s*RAC#?[\s\*]*[:=]?[\s\*]*(RA[\s\-:#]*\d+)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return canonical_ra_id(match.group(1))
+    return ""
+
+
 def _parse_single_edo_trace_response(edo_tag, response):
     """
     Parses ONE EDO's raw LLM response into {"traces": [str, ...]}.
@@ -2383,7 +2616,10 @@ def _parse_single_edo_trace_response(edo_tag, response):
                     normalize_text(t) for t in obj["traces"]
                     if normalize_text(t) and not _is_noise_code(t)
                 ]
-                return {"traces": traces}
+                return {
+                    "traces": traces,
+                    "RA_Number": _extract_trace_ra_number(obj)
+                }
             if edo_tag in obj and isinstance(obj[edo_tag], dict):
                 return normalize_result(obj[edo_tag])
             for v in obj.values():
@@ -2407,7 +2643,10 @@ def _parse_single_edo_trace_response(edo_tag, response):
     custom_traces = parse_custom_fmea_format(response)
     if custom_traces:
         pass
-        return {"traces": custom_traces}
+        return {
+            "traces": custom_traces,
+            "RA_Number": _extract_trace_ra_number_from_text(response)
+        }
 
     # 4. Markdown fallback parser
     markdown_records = parse_markdown_trace_response(response)
@@ -2419,11 +2658,20 @@ def _parse_single_edo_trace_response(edo_tag, response):
                 traces.extend(normalize_text(t) for t in module_controls if normalize_text(t))
         if traces:
             pass
-            return {"traces": traces}
+            return {
+                "traces": traces,
+                "RA_Number": (
+                    canonical_ra_id(markdown_records[0].get("Trace To RAC#"))
+                    or _extract_trace_ra_number_from_text(response)
+                )
+            }
 
     pass
     pass
-    return {"traces": []}
+    return {
+        "traces": [],
+        "RA_Number": _extract_trace_ra_number_from_text(response)
+    }
 
 
 def extract_json_code_blocks(text):
@@ -2547,6 +2795,19 @@ _MODULE_DFMEA_TRACE_PATTERN = re.compile(
 _MODULE_DFMEA_DOCUMENT_PATTERN = re.compile(r"\b(NPD\d+)\b", re.IGNORECASE)
 
 
+def _is_empty_trace_value(value):
+    """
+    True when a trace value from the LLM is really "nothing": blank, "[]",
+    "None", "null", "-", etc. Such values must stay blank in Excel.
+    (_is_noise_code() already covers N/A, Not Found, Unknown, TBD ...)
+    """
+    cleaned = re.sub(r"[\s\[\]\(\)\{\}'\"`]+", "", normalize_text(value)).lower()
+    return cleaned in {
+        "", "none", "null", "nil", "nan", "na", "n/a", "-", "--", "empty",
+        "notfound", "notavailable", "nomatch", "nomatchfound",
+    }
+
+
 def normalize_module_dfmea_trace_lines(traces):
     """Return display-ready Module DFMEA traces without their Cause text.
 
@@ -2559,11 +2820,16 @@ def normalize_module_dfmea_trace_lines(traces):
     seen = set()
     prior_document = ""
 
+    # A bare string (e.g. "None" / "[]") must not be iterated character by
+    # character - treat it as a single trace value.
+    if isinstance(traces, str):
+        traces = [traces]
+
     for raw_trace in traces or []:
         if not isinstance(raw_trace, str):
             continue
         text = normalize_text(raw_trace)
-        if not text or _is_noise_code(text):
+        if not text or _is_noise_code(text) or _is_empty_trace_value(text):
             continue
 
         module_tags = _MODULE_DFMEA_TRACE_PATTERN.findall(text)
@@ -2585,6 +2851,53 @@ def normalize_module_dfmea_trace_lines(traces):
                 prior_document = document_number
 
     return normalized_lines
+
+
+def reconcile_existing_edo_ra_with_fmea_document(edo, fmea_doc_ra):
+    """
+    RA/FMEA pair check for ONE Existing EDO, run right after CALL 3.
+
+    `fmea_doc_ra` is the RA_Number the FMEA document returned for this
+    EDO's exact FMEA row (CALL 3 response).
+
+      * FMEA document returned no RA          -> nothing changes.
+      * RA matches the EDO-document RA        -> nothing changes.
+      * RA differs from the EDO-document RA   -> the OLD RA is kept in
+        "Original_RA_Number" (used only by the Column M observation) and
+        "ra_number" / "RA_Number" are replaced by the FMEA-document RA, so
+        every later step (CALL 6, merge, CALL 7, CALL 8, Column D, ...)
+        works with the new RA.
+      * EDO-document RA was blank             -> the FMEA-document RA is
+        filled in silently (there is no old RA to report in an observation).
+    """
+    new_ra = canonical_ra_id(fmea_doc_ra)
+    logging.info("RA reconcile | EDO=%s FMEA=%s | EDO-doc RA=%r | FMEA-doc RA=%r",
+                 edo.get("edo_tag"), edo.get("FMEA_Number"),
+                 edo.get("ra_number") or edo.get("RA_Number"), fmea_doc_ra)
+    if not new_ra:
+        logging.warning("RA reconcile: CALL 3 returned NO RA for %s / %s -> nothing to colour/strike",
+                        edo.get("edo_tag"), edo.get("FMEA_Number"))
+        return edo
+
+    old_ra_text = normalize_text(edo.get("ra_number") or edo.get("RA_Number"))
+    old_ra = canonical_ra_id(old_ra_text)
+
+    # What the FMEA document said for this exact FMEA row. Stored under
+    # their own keys so CALL 6 (which refreshes FMEA_Document_*) cannot
+    # wipe them before the observation is built.
+    edo["Trace_FMEA_Document_RA_Number"] = new_ra
+    edo["Trace_FMEA_Document_FMEA_Number"] = normalize_text(edo.get("FMEA_Number"))
+
+    if old_ra == new_ra:
+        return edo
+
+    if old_ra:
+        logging.info("RA MISMATCH %s: old %s (strike) -> new %s (red)", edo.get("edo_tag"), old_ra, new_ra)
+        edo["Original_RA_Number"] = old_ra_text
+
+    edo["ra_number"] = new_ra
+    edo["RA_Number"] = new_ra
+    return edo
 
 
 def apply_existing_edo_trace(existing_edos, trace_details):
@@ -2639,6 +2952,14 @@ def apply_existing_edo_trace(existing_edos, trace_details):
             matched_count += 1
         else:
             edo["existing_trace"] = ""
+
+        # RA/FMEA pair check: if the FMEA document's RA differs from the
+        # EDO-document RA, remember the old one (for the observation) and
+        # switch this EDO to the FMEA-document RA for all later steps.
+        reconcile_existing_edo_ra_with_fmea_document(
+            edo,
+            row.get("RA_Number")
+        )
 
     pass
 
@@ -2976,6 +3297,19 @@ def extract_new_edo_summary_details(
         # PROJECT IDs - see resolve_best_traceability_row().
         entry["Project_code"] = get_llm_value(
             detail_row, "Project_code", "Project Code", "CP", "cp"
+        )
+        # NEW: "Reference code with standards" - the LLM's mapping of each
+        # verification code to the standard it is verified against, e.g.
+        #   "(DRS-808 ISO 18562-1: 2017, DRS-809 ISO 18562-3: 2017, ...)"
+        # Kept as ONE raw string variable. Used only by CALL 8 as a
+        # fallback when a code has no traceability document of its own -
+        # see extract_and_apply_verification_evidence().
+        entry["Reference_Code_With_Standards"] = get_llm_value(
+            detail_row,
+            "Reference code with standards",
+            "Reference_Code_With_Standards",
+            "Reference_Code_With_Standard",
+            "reference_code_standards"
         )
 
     # Remove records with no details and records whose Risk_Status is
@@ -3855,6 +4189,17 @@ def merge_new_edo_records(new_records, existing_edos):
             "Project_code": _normalize_project_code(
                 get_llm_value(row, "Project_code", "Project Code", "CP", "cp")
             ),
+
+            # NEW: code -> standard mapping from extract_new_edo_summary_details()
+            # (raw string). Read by CALL 8 for the standards fallback.
+            "reference_code_with_standards": normalize_text(
+                get_llm_value(
+                    row,
+                    "Reference_Code_With_Standards",
+                    "Reference code with standards",
+                    "reference_code_with_standards"
+                )
+            ),
         }
 
     pass
@@ -3899,7 +4244,12 @@ def merge_existing_edo_dictionary(existing_details):
             "Project_code": _normalize_project_code(data.get("Project_code", "")),
             "design_elements": data.get("design_elements", []),
             "FMEA_Document_RA_Number": data.get("FMEA_Document_RA_Number", ""),
-            "FMEA_Document_FMEA_Number": data.get("FMEA_Document_FMEA_Number", "")
+            "FMEA_Document_FMEA_Number": data.get("FMEA_Document_FMEA_Number", ""),
+            # Set by CALL 3 RA/FMEA pair check (see
+            # reconcile_existing_edo_ra_with_fmea_document()).
+            "Original_RA_Number": data.get("Original_RA_Number", ""),
+            "Trace_FMEA_Document_RA_Number": data.get("Trace_FMEA_Document_RA_Number", ""),
+            "Trace_FMEA_Document_FMEA_Number": data.get("Trace_FMEA_Document_FMEA_Number", "")
         }
     return final
 
@@ -4767,7 +5117,7 @@ def _normalize_project_code(value):
     return re.sub(r'[^A-Z0-9]', '', text)
 
 
-def resolve_best_traceability_row(candidate_rows: List[dict], project_code: str):
+def resolve_best_traceability_rows(candidate_rows: List[dict], project_code: str):
     """
     Given every traceability-spreadsheet row that matched a single
     verification code (see _query_traceability_details_batch()'s
@@ -4785,12 +5135,14 @@ def resolve_best_traceability_row(candidate_rows: List[dict], project_code: str)
       2. If more than one Current row remains, select the newest revision
          in V/V RECORD LOCATION.  Where no location contains a revision,
          use the newest REQ DOC REV.
-      3. Original response order is the final deterministic tiebreaker.
+      3. Every row still tied for the highest revision is KEPT (previously
+         only the first one was returned), in the original response order.
 
-    Returns a single row dict, or None if candidate_rows is empty.
+    Returns a LIST of rows (all rows tied for the best revision), or an
+    empty list if candidate_rows is empty.
     """
     if not candidate_rows:
-        return None
+        return []
     # Status is the primary rule: a Current row must win over an older
     # Superseded row even when the latter happens to match a project value.
     current_matches = [
@@ -4830,7 +5182,123 @@ def resolve_best_traceability_row(candidate_rows: List[dict], project_code: str)
             best_revision = max(revision for revision in req_doc_revisions if revision is not None)
             pool = [row for row, revision in zip(pool, req_doc_revisions) if revision == best_revision]
 
-    return pool[0]
+    return pool
+
+
+def resolve_best_traceability_row(candidate_rows: List[dict], project_code: str):
+    """Single-row wrapper kept for backward compatibility (first tied row)."""
+    rows = resolve_best_traceability_rows(candidate_rows, project_code)
+    return rows[0] if rows else None
+
+
+def _select_best_trace_entries(candidates: List[dict], project_code: str) -> List[dict]:
+    """
+    candidates: [{"row":..., "document_index":..., "document_name":...}, ...]
+    Returns every candidate entry tied for the best Current / highest
+    revision, with exact-duplicate rows collapsed (Stage 1 rule).
+    """
+    rows = resolve_best_traceability_rows(
+        [c["row"] for c in candidates], project_code
+    )
+    selected, seen = [], set()
+    for row in rows:
+        entry = next((c for c in candidates if c["row"] is row), None)
+        if entry is None:
+            continue
+        key = json.dumps(row, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(entry)
+    return selected
+
+
+def _trace_revision_number(value):
+    """Sortable revision from values such as ``NPD50300 Rev 2`` / bare ``13``."""
+    value = normalize_text(value)
+    match = re.search(r"\brev(?:ision)?\s*[-:]?\s*(\d+)\b", value, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return int(value) if re.fullmatch(r"\d+", value) else None
+
+
+def _trace_row_identity(row):
+    """(V/V RECORD LOCATION, V/V RECORD FILE NAME) in comparable form."""
+    return (
+        normalize_text(get_llm_value(row, "vv_record_location", "VV_Record_Location")).lower(),
+        normalize_text(get_llm_value(row, "vv_record_file_name", "VV_Record_File_Name")).lower(),
+    )
+
+
+def _rank_alternate_entries(candidates, exclude_idents=None):
+    """
+    NEXT-REVISION support.  `candidates` is every real traceability row found
+    for ONE code.  Returns the Current rows (real content, de-duplicated by
+    location + filename, never one of `exclude_idents`) ordered from the
+    next-highest V/V RECORD LOCATION revision downwards, then REQ DOC REV.
+    CALL 8 walks this list when the highest-revision document has no evidence.
+    """
+    exclude_idents = set(exclude_idents or [])
+    seen = set(exclude_idents)
+    alternates = []
+    for entry in candidates or []:
+        row = entry.get("row") or {}
+        status = normalize_text(
+            get_llm_value(row, "Record_Status", "Record Status", "RECORD STATUS", "Status")
+        ).lower()
+        if "current" not in status or not _has_real_traceability_content(row):
+            continue
+        ident = _trace_row_identity(row)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        alternates.append(entry)
+
+    def _sort_key(entry):
+        row = entry["row"]
+        loc_rev = _trace_revision_number(get_llm_value(row, "vv_record_location", "VV_Record_Location"))
+        doc_rev = _trace_revision_number(get_llm_value(row, "req_doc_rev", "Req_Doc_Rev", "REQ DOC REV"))
+        return (loc_rev if loc_rev is not None else -1, doc_rev if doc_rev is not None else -1)
+
+    alternates.sort(key=_sort_key, reverse=True)
+    return alternates
+
+
+def _alternate_record_from_entry(entry, code):
+    """Flatten one alternate trace entry into the dict CALL 8 consumes."""
+    row = entry["row"]
+    tag = get_llm_value(row, "req_tag", "Req_Tag", "REQ_TAG") or code
+    filename = get_llm_value(row, "vv_record_file_name", "VV_Record_File_Name") or ""
+    location = get_llm_value(row, "vv_record_location", "VV_Record_Location") or ""
+    if _is_noise_code(filename):
+        filename = ""
+    if _is_noise_code(location):
+        location = ""
+    return {
+        "prefix": f"{tag} {location}".strip(),
+        "filename": filename,
+        "location": location,
+        "doc_number": (
+            _extract_doc_number(location)
+            or _extract_doc_number(filename)
+            or _extract_doc_number(entry.get("document_name"))
+            or ""
+        ),
+    }
+
+
+def _entry_with_all_matches(selected: List[dict], candidates=None) -> dict:
+    """First tied entry (used by existing code) + every tied entry.
+
+    `candidates` (optional) = every real row found for the code.  The rows that
+    were NOT selected become `alternates` (next revision first) for CALL 8.
+    """
+    best = dict(selected[0])
+    best["all_matches"] = selected
+    best["alternates"] = _rank_alternate_entries(
+        candidates, {_trace_row_identity(e["row"]) for e in selected}
+    ) if candidates else []
+    return best
 
 
 # BUGFIX: some traceability documents act as a master index/table of
@@ -5099,6 +5567,9 @@ def search_codes_across_documents(
     # produce the correct, project-matching row before one is finally
     # chosen (see the resolution step after the document loop).
     real_candidates: Dict[str, List[dict]] = {}
+    # EVERY real row seen per code (all revisions) - source of the NEXT-REVISION
+    # alternates handed to CALL 8.
+    all_real_candidates: Dict[str, List[dict]] = {}
     prefix_document_map = build_traceability_prefix_document_map(
         traceability_documents, pipeline_config, prompt_data
     )
@@ -5130,7 +5601,7 @@ def search_codes_across_documents(
             return False
 
         try:
-            row = resolve_best_traceability_row(
+            tied_rows = resolve_best_traceability_rows(
                 candidate_rows,
                 project_code
             )
@@ -5138,8 +5609,17 @@ def search_codes_across_documents(
             pass
             return False
 
-        if not row:
+        if not tied_rows:
             return False
+        row = tied_rows[0]
+
+        for _candidate_row in candidate_rows:
+            if isinstance(_candidate_row, dict) and _has_real_traceability_content(_candidate_row):
+                all_real_candidates.setdefault(code, []).append({
+                    "row": _candidate_row,
+                    "document_index": doc_index,
+                    "document_name": doc_name,
+                })
 
         # --------------------------------------------------------------
         # REAL MATCH
@@ -5150,11 +5630,14 @@ def search_codes_across_documents(
         # not influence which matching traceability record is selected.
         # --------------------------------------------------------------
         if _has_real_traceability_content(row):
-            real_candidates.setdefault(code, []).append({
-                "row": row,
-                "document_index": doc_index,
-                "document_name": doc_name,
-            })
+            for tied_row in tied_rows:
+                if not _has_real_traceability_content(tied_row):
+                    continue
+                real_candidates.setdefault(code, []).append({
+                    "row": tied_row,
+                    "document_index": doc_index,
+                    "document_name": doc_name,
+                })
 
             pass
 
@@ -5207,11 +5690,8 @@ def search_codes_across_documents(
     # workbook in database order. This preserves the Current/latest-revision
     # contract even when workbooks overlap.
     for code, candidates in local_candidates.items():
-        selected_row = resolve_best_traceability_row(
-            [candidate["row"] for candidate in candidates], project_code
-        )
-        selected = next(candidate for candidate in candidates if candidate["row"] is selected_row)
-        resolved[code] = selected
+        selected_entries = _select_best_trace_entries(candidates, project_code)
+        resolved[code] = _entry_with_all_matches(selected_entries, candidates)
 
     remaining = [code for code in remaining if code not in resolved]
     if local_candidates:
@@ -5466,13 +5946,11 @@ def search_codes_across_documents(
         # together instead of one document's single response.
         if code in real_candidates:
             candidates = real_candidates[code]
-            candidate_rows = [c["row"] for c in candidates]
-            best_row = resolve_best_traceability_row(candidate_rows, project_code)
-            best_entry = next(
-                (c for c in candidates if c["row"] is best_row),
-                candidates[0]
+            selected_entries = _select_best_trace_entries(candidates, project_code)
+            resolved[code] = _entry_with_all_matches(
+                selected_entries or candidates[:1],
+                all_real_candidates.get(code) or candidates,
             )
-            resolved[code] = best_entry
 
             pass
 
@@ -5646,6 +6124,85 @@ def _extract_structured_traceability_rows_from_context(documents, codes: List[st
     return rows_by_code
 
 
+def _flatten_nested_trace_records(records):
+    """
+    The LLM sometimes answers a traceability query grouped PER REQ TAG:
+
+        [{"req_tag": "MBS-SRS-282",
+          "records": [{"vv_record_file_name": ..., "vv_record_location": ...,
+                       "req_result": "PASS", "record status": "Current"}, ...]}]
+
+    instead of the flat one-object-per-row list the CALL 7 contract asks for.
+    The inner rows carry no req_tag / location / status at the TOP level, so
+    the old parser saw an "empty" row, treated the code as NOT FOUND and
+    printed N/A in Column E (and a "not found in the Traceability excels"
+    Gap in Column M) even though the response held the answer.
+    This expands every nested group into flat rows; each child inherits the
+    parent's req_tag (and any other parent field it lacks).
+    """
+    flat = []
+
+    def _walk(item, inherited):
+        if not isinstance(item, dict):
+            return
+        nested = None
+        for key in ("records", "Records", "rows", "Rows", "matches", "Matches"):
+            if isinstance(item.get(key), list):
+                nested = item[key]
+                break
+        parent_fields = {k: v for k, v in item.items()
+                         if not isinstance(v, (list, dict))}
+        merged_parent = dict(inherited)
+        merged_parent.update(parent_fields)
+        if nested is None:
+            row = dict(item)
+            for k, v in inherited.items():
+                row.setdefault(k, v)
+            flat.append(row)
+            return
+        for child in nested:
+            _walk(child, merged_parent)
+
+    for record in records or []:
+        _walk(record, {})
+    return flat
+
+
+def _extract_tabbed_traceability_rows_from_context(documents, codes: List[str]) -> Dict[str, List[dict]]:
+    """
+    Fallback for traceability chunks stored as raw TAB-separated rows (no
+    "HEADER: value" labels), e.g.
+        MBS-SRS-292<TAB>15<TAB>SV MBS 1 SW V&V-SUS003712<TAB>NPD41083<TAB>PASS<TAB>None<TAB>SUS003712<TAB>Current
+    Column order = REQ TAG, REQ DOC REV, V/V RECORD FILE NAME,
+    V/V RECORD LOCATION, REQ RESULT, ISSUE, PROJECT ID, RECORD STATUS.
+    Only rows whose last column is a recognised record status are accepted.
+    """
+    status_words = ("current", "superseded", "obsolete")
+    rows_by_code: Dict[str, List[dict]] = {}
+    for document in documents or []:
+        for line in str(document).replace("\r", "\n").splitlines():
+            if "\t" not in line:
+                continue
+            fields = [normalize_text(part) for part in line.split("\t")]
+            fields = [f for f in fields]
+            # drop a leading section label such as "Preamble  MBS-SRS-292"
+            first = re.sub(r"^(?:[A-Za-z ]+?)\s{2,}(?=\S)", "", fields[0]) if fields else ""
+            if first:
+                fields[0] = first
+            if len(fields) < 8 or fields[7].strip().lower() not in status_words:
+                continue
+            matched_code = _match_record_to_code(fields[0], codes)
+            if not matched_code:
+                continue
+            rows_by_code.setdefault(matched_code, []).append({
+                "req_tag": fields[0], "req_doc_rev": fields[1],
+                "vv_record_file_name": fields[2], "vv_record_location": fields[3],
+                "req_result": fields[4], "issue": fields[5],
+                "Project_ID": fields[6], "Record_Status": fields[7],
+            })
+    return rows_by_code
+
+
 def _find_code_in_record(record: dict, codes: List[str]):
     """
     Fallback used when a batch-returned record's req_tag field doesn't
@@ -5659,7 +6216,7 @@ def _find_code_in_record(record: dict, codes: List[str]):
     return None
 
 
-def _query_traceability_details_batch(pipeline_config, collection, prompt_data, codes: List[str], project_code, source_document_name="", source_row_audit=False):
+def _query_traceability_details_batch(pipeline_config, collection, prompt_data, codes: List[str], project_code, source_document_name="", source_row_audit=False, question_override=""):
     """
     Shared multi-code LLM query used by search_codes_across_documents().
     Targets ALL of the given codes for ONE traceability document in a
@@ -5684,9 +6241,13 @@ def _query_traceability_details_batch(pipeline_config, collection, prompt_data, 
     codes_list_str = ", ".join(codes)
     Record_status ="current"
     #Extract the details for the specific code: {codes_list_str} with record status: {Record_status}
+    #Find all {codes_list_str} records where RECORD STATUS is Current.  For each req_tag, use the revision in V/V RECORD LOCATION and return all records with the highest revision. If two or more records have the same highest revision, return all of those records. Do not remove duplicates when they have the same highest revision. Do not use REQ DOC REV.  Return valid JSON only.
     question = (
-        f"Extract ONLY the latest revision record for the code: {codes_list_str}. If multiple rows exist, return only one row with the highest revision number."
+        f"Find all {codes_list_str} records where RECORD STATUS is Current.  For each req_tag, use the revision in V/V RECORD LOCATION and return all records with the highest revision. If two or more records have the same highest revision, return all of those records. Do not remove duplicates when they have the same highest revision. Do not use REQ DOC REV.  Return valid JSON only."
     )
+    if question_override:
+        question = question_override
+
     # if source_row_audit:
     #     question += (
     #         " SOURCE-ROW AUDIT: Do a second pass through the supplied source "
@@ -5770,6 +6331,9 @@ appears in the matched source row's PROJECT ID column.
     records = deep_extract_records(parsed)
     if not records and isinstance(parsed, dict):
         records = [parsed]
+    # Expand {"req_tag": X, "records": [...]} groups into flat per-row dicts
+    # (otherwise the row looks empty and the code is reported as N/A).
+    records = _flatten_nested_trace_records(records)
 
     # Split the batch response back apart: match each returned record to
     # the one code (out of the codes we sent) it actually belongs to. A
@@ -5812,6 +6376,15 @@ appears in the matched source row's PROJECT ID column.
     for code, rows in structured_rows.items():
         rows_by_code.setdefault(code, []).extend(rows)
 
+    # Last resort: raw tab-separated chunks (no "HEADER: value" labels). Used
+    # only for codes that still have NO usable row after the LLM + labelled parse.
+    _missing_codes = [c for c in codes if not rows_by_code.get(c)]
+    if _missing_codes:
+        for code, rows in _extract_tabbed_traceability_rows_from_context(
+            retrieved_documents, _missing_codes
+        ).items():
+            rows_by_code.setdefault(code, []).extend(rows)
+
     # Deduplicate rows returned by both the LLM and the structured source
     # parser before comparing their count with the source context.
     for code, rows in list(rows_by_code.items()):
@@ -5829,7 +6402,7 @@ appears in the matched source row's PROJECT ID column.
     # one narrow audit only in that exceptional case.  It preserves batching
     # for ordinary IDs, but guarantees the code-side revision selector sees
     # every Current candidate when duplicate IDs exist (for example DRS-486).
-    if not source_row_audit:
+    if not source_row_audit and not question_override:
         for code in codes:
             context_count = _source_context_trace_code_occurrences(retrieved_documents, code)
             returned_count = len(rows_by_code.get(code, []))
@@ -5850,6 +6423,28 @@ appears in the matched source row's PROJECT ID column.
                     seen.add(key)
 
     return rows_by_code
+
+
+# Column M ("Remarks and Recommendation") -> "Gap" section wording.
+# {codes} = comma-separated list of every code CALL 7 could not find.
+TRACE_CODE_NOT_FOUND_REMARK = "The code {codes} was not found in the Traceability excels."
+TRACE_CODES_NOT_FOUND_REMARK = "The codes {codes} were not found in the Traceability excels."
+EVIDENCE_NOT_FOUND_REMARK = (
+    "The evidence was not able to be found for the {label} {codes} in the {source}."
+)
+# Printed instead when the source document itself is NOT in the evidence document list.
+DOCUMENT_NOT_FOUND_REMARK = (
+    "The document {source}for the {label} {codes} was not found in the evidence document list."
+)
+
+
+def _traceability_document_name(doc):
+    return normalize_text(
+        (doc or {}).get("document_name")
+        or (doc or {}).get("name")
+        or (doc or {}).get("originalfilename")
+        or (doc or {}).get("filename")
+    )
 
 
 def build_final_edos_with_traceability(
@@ -5937,6 +6532,12 @@ def build_final_edos_with_traceability(
         pass
         return [dict(record) for _, record in merged_items]
 
+    # CALL 8 re-uses this prompt to ask CALL 7 for the NEXT revision record.
+    try:
+        edo_document["trace_prompt_data"] = prompt_data
+    except Exception:
+        pass
+
     traceability_documents = _get_traceability_documents(edo_document)
     if not traceability_documents:
         pass
@@ -5961,6 +6562,13 @@ def build_final_edos_with_traceability(
     # search_codes_across_documents().
     trace_resolution_cache: Dict[tuple, dict] = {}
     trace_cache_lock = threading.Lock()
+
+    def _all_traceability_document_names():
+        names = [
+            _traceability_document_name(doc) for doc in (traceability_documents or [])
+        ]
+        names = [name for name in dict.fromkeys(names) if name]
+        return ", ".join(names) if names else "traceability document"
 
     # Resolve repeated code/project pairs before scheduling row work.  The
     # previous per-EDO worker model could submit the same RTM lookup several
@@ -6030,6 +6638,23 @@ def build_final_edos_with_traceability(
         pass
         pass
 
+        try:
+            _debug_prefix_map = build_traceability_prefix_document_map(
+                traceability_documents, pipeline_config, prompt_data
+            )
+        except Exception:
+            _debug_prefix_map = {}
+
+        def _debug_route(code):
+            prefix = _code_prefix_hint(code)
+            idx = _debug_prefix_map.get(prefix)
+            if idx is None:
+                return prefix, "(unmapped -> all documents searched)"
+            try:
+                return prefix, f"#{idx} {_traceability_document_name(traceability_documents[idx])}"
+            except Exception:
+                return prefix, f"#{idx}"
+
         matched_trace_details_by_code: Dict[str, str] = {}
         # NEW: identity-agnostic document number captured per code, used
         # by CALL 8 to look up the EDO_VER source document directly.
@@ -6037,6 +6662,19 @@ def build_final_edos_with_traceability(
         # Kept separately from the display line so Column F can stop before
         # attempting to retrieve a report for a Superseded trace record.
         trace_status_by_code: Dict[str, str] = {}
+        # Codes the traceability call could not find ("[]", "N/A", "Not
+        # found", blank row) -> one Column M "Gap" line per code.
+        trace_not_found_codes: List[str] = []
+
+        def _record_code_not_found(code, source_name=""):
+            if code and code not in trace_not_found_codes:
+                trace_not_found_codes.append(code)
+
+        # Extra records for a code when several rows are tied for the same
+        # highest revision: code -> [(trace_line, doc_number), ...].
+        extra_trace_entries_by_code: Dict[str, List[tuple]] = {}
+        # NEXT-REVISION records per code (highest revision excluded) for CALL 8.
+        alternate_records_by_code: Dict[str, List[dict]] = {}
         # Column M ("Remarks and Recommendation") needs a called-out remark
         # for every verification code whose traceability call comes back
         # with a Fail result - collected here and merged into the record
@@ -6076,6 +6714,15 @@ def build_final_edos_with_traceability(
             match = resolved.get(code)
 
             if not match:
+                # LLM returned nothing usable ([] / N/A / Not found) for this
+                # code in any traceability document.
+                _record_code_not_found(code, "")
+                _p, _r = _debug_route(code)
+                _record_trace_debug(
+                    key, ra_number, fmea_number, code, _p, _r,
+                    "N/A - NO MATCH: no usable row for this code in the routed/searched traceability document(s). "
+                    "Check LLM_Debug tab (stage _query_traceability_details_batch): does the retrieved context contain this code?"
+                )
                 # A missing traceability record is terminal for this code.
                 # Column E must show N/A and Column F must not spend a CALL 8
                 # lookup trying to infer evidence from an unrelated document.
@@ -6086,6 +6733,11 @@ def build_final_edos_with_traceability(
 
             row = match["row"]
             source_document_name = match.get("document_name")
+
+            # A row with a blank / "N/A" V/V record location AND file name is
+            # an index-only hit: the code was not really found.
+            if not _has_real_traceability_content(row):
+                _record_code_not_found(code, normalize_text(source_document_name))
 
             req_tag_value = get_llm_value(row, "req_tag", "Req_Tag", "REQ_TAG") or code
             filename = get_llm_value(row, "vv_record_file_name", "VV_Record_File_Name") or "N/A"
@@ -6099,7 +6751,16 @@ def build_final_edos_with_traceability(
             # Obsolete, blank-status, or otherwise non-Current match means
             # this prefix-category source has no current verification record;
             # it must render as N/A and never trigger a Column F lookup.
-            if "current" not in record_status.lower():
+            _status_is_blank = not record_status.strip()
+            _accept_blank_status = bool(pipeline_config.get("accept_blank_record_status", False))
+            if "current" not in record_status.lower() and not (_status_is_blank and _accept_blank_status):
+                _p, _r = _debug_route(code)
+                _record_trace_debug(
+                    key, ra_number, fmea_number, code, _p, _r,
+                    f"N/A - ROW FOUND BUT RECORD STATUS IS NOT 'Current' (value: {record_status!r})"
+                    + (" - status BLANK; set pipeline_config['accept_blank_record_status']=True if this sheet has no status column" if _status_is_blank else ""),
+                    record_status, location, filename, result_text, normalize_text(source_document_name)
+                )
                 matched_trace_details_by_code[code] = "N/A" if len(parsed_codes) == 1 else f"{code} N/A"
                 matched_doc_number_by_code[code] = ""
                 trace_status_by_code[code] = (
@@ -6112,6 +6773,12 @@ def build_final_edos_with_traceability(
             # Final output format the user wants in the Excel cell:
             # "<Req_Tag> <V/V RECORD LOCATION> - <V/V RECORD FILE NAME>"
             trace_entry = f"{req_tag_value} {location} - {filename}"
+            _p, _r = _debug_route(code)
+            _record_trace_debug(
+                key, ra_number, fmea_number, code, _p, _r, "OK - Current record used for Column E",
+                record_status or "(blank - accepted)", location, filename, result_text,
+                normalize_text(source_document_name)
+            )
             matched_trace_details_by_code[code] = trace_entry
             trace_status_by_code[code] = "Current" if "current" in record_status.lower() else record_status
 
@@ -6127,6 +6794,13 @@ def build_final_edos_with_traceability(
             )
             matched_doc_number_by_code[code] = doc_number or ""
 
+            _alternates = [
+                _alternate_record_from_entry(alt_entry, code)
+                for alt_entry in (match.get("alternates") or [])
+            ]
+            if _alternates:
+                alternate_records_by_code[code] = _alternates
+
             pass
 
             # If this code's traceability test result comes back Fail, flag it
@@ -6140,33 +6814,84 @@ def build_final_edos_with_traceability(
                 fail_remarks.append(fail_remark)
                 pass
 
+            # Several rows tied for the SAME highest revision: print every
+            # one of them (as returned by the LLM / source), not just the
+            # first. Each extra row becomes its own line under the code.
+            for extra in (match.get("all_matches") or [])[1:]:
+                extra_row = extra["row"]
+                extra_status = normalize_text(
+                    get_llm_value(extra_row, "Record_Status", "Record Status", "RECORD STATUS", "Status")
+                )
+                if "current" not in extra_status.lower():
+                    continue
+                extra_tag = get_llm_value(extra_row, "req_tag", "Req_Tag", "REQ_TAG") or code
+                extra_filename = get_llm_value(extra_row, "vv_record_file_name", "VV_Record_File_Name") or "N/A"
+                extra_location = get_llm_value(extra_row, "vv_record_location", "VV_Record_Location") or "N/A"
+                extra_result = get_llm_value(extra_row, "req_result", "Req_Result", "REQ_RESULT") or "N/A"
+                extra_line = f"{extra_tag} {extra_location} - {extra_filename}"
+                already = [matched_trace_details_by_code.get(code)] + [
+                    line for line, _ in extra_trace_entries_by_code.get(code, [])
+                ]
+                if extra_line in already:
+                    continue
+                extra_doc_number = (
+                    _extract_doc_number(extra_location)
+                    or _extract_doc_number(extra_filename)
+                    or _extract_doc_number(extra.get("document_name"))
+                )
+                extra_trace_entries_by_code.setdefault(code, []).append(
+                    (extra_line, extra_doc_number or "")
+                )
+                if "fail" in normalize_text(extra_result).strip().lower():
+                    extra_fail_remark = (
+                        f'The following "{code}" test report is not identified and not '
+                        "verified in any of the traceability spreadsheets or records."
+                    )
+                    if extra_fail_remark not in fail_remarks:
+                        fail_remarks.append(extra_fail_remark)
+
         # Rebuild the trace-detail list in the SAME order codes originally
-        # appeared in verification_reference.
-        matched_trace_details = [
-            matched_trace_details_by_code[code]
-            for code in parsed_codes
-            if code in matched_trace_details_by_code
-        ]
-        # Same positional order for the document-number list, so index i
-        # of verification_reference_doc_numbers corresponds to index i of
-        # verification_reference_parsed / the i-th line of the joined
-        # verification_reference text below.
-        matched_doc_numbers = [
-            matched_doc_number_by_code[code]
-            for code in parsed_codes
-            if code in matched_trace_details_by_code
-        ]
+        # appeared in verification_reference. A code with several tied
+        # records contributes one line (and one code / doc-number entry)
+        # per record, so the three parallel lists stay positionally aligned
+        # for CALL 8.
+        matched_trace_details = []
+        matched_doc_numbers = []
+        expanded_codes = []
+        for code in parsed_codes:
+            if code not in matched_trace_details_by_code:
+                continue
+            matched_trace_details.append(matched_trace_details_by_code[code])
+            matched_doc_numbers.append(matched_doc_number_by_code[code])
+            expanded_codes.append(code)
+            for extra_line, extra_doc_number in extra_trace_entries_by_code.get(code, []):
+                matched_trace_details.append(extra_line)
+                matched_doc_numbers.append(extra_doc_number)
+                expanded_codes.append(code)
 
         # Assign the resolved trace text back onto verification_reference itself -
         # this is the field format_edo_worksheet() writes into the output Excel,
         # so the resolved location/filename/result now actually reach the sheet.
-        final_record["verification_reference_parsed"] = parsed_codes
+        final_record["verification_reference_parsed"] = expanded_codes
         final_record["verification_reference"] = "\n".join(matched_trace_details)
         final_record["verification_reference_doc_numbers"] = matched_doc_numbers
         final_record["verification_trace_statuses"] = trace_status_by_code
+        final_record["verification_alternate_records"] = alternate_records_by_code
         # Picked up by generate_remarks_and_recommendation() below and
         # rendered into Column M ("Remarks and Recommendation").
         final_record["traceability_fail_remarks"] = fail_remarks
+        # ONE line listing every not-found code, comma separated.
+        if trace_not_found_codes:
+            not_found_template = (
+                TRACE_CODE_NOT_FOUND_REMARK
+                if len(trace_not_found_codes) == 1
+                else TRACE_CODES_NOT_FOUND_REMARK
+            )
+            final_record["traceability_not_found_remarks"] = [
+                not_found_template.format(codes=", ".join(trace_not_found_codes))
+            ]
+        else:
+            final_record["traceability_not_found_remarks"] = []
 
         return final_record
 
@@ -6724,96 +7449,171 @@ def _same_evidence_source_filename(left, right) -> bool:
     return bool(left_tokens and right_tokens and left_tokens == right_tokens)
 
 
-def find_verification_evidence_document(edo_document, filename_hint, doc_number=None):
-    """
-    Finds the source document matching a Column E verification code, in
-    three stages:
+_EVIDENCE_FILE_EXT = r"(?:pdf|docx?|xlsx?|xlsm|csv|zip|pptx?|txt|msg|png|jpe?g)"
 
-      1. EXACT V/V RECORD FILE NAME match.  This is the direct source
-         selected for Column E, so it takes precedence over a reused NPD
-         number in an unrelated document.
-      2. EXACT document-number match (e.g. "NPD43975") only when Column E
-         did not provide a V/V record filename.
-         edo_document["documents_by_number"] - an IDENTITY-AGNOSTIC
-         index built in get_edo_document() from EVERY mapped document's
-         name, regardless of its document_identity tag. This is the
-         primary, unambiguous path and works even when a document's
-         document_identity in the DB is null/untagged.
-      3. FALLBACK - token-overlap PARTIAL filename match only when Column E
-         did not provide a V/V record filename, against
-         edo_document["evidence_candidate_documents"] - EVERY mapped
-         document except the four structural ones (EDO_Proposed,
-         EDO_RA_C, EDO_FMEA, EDO_pdf_new), regardless of
-         document_identity tag or whether it has an NPD number in its
-         name. This deliberately widens beyond just "EDO_VER"-tagged
-         documents, because many real V/V evidence files (e.g.
-         "SV CTRL 1 SW V&V General.pdf", "Vest APX APG Module EE
-         Feature Test Result.pdf") have neither a document number NOR
-         an EDO_VER identity tag - they were previously skipped
-         entirely. Falls back further to edo_ver_documents alone only
-         if evidence_candidate_documents isn't populated (older
-         edo_document dicts / backwards compatibility).
+# When several documents share one NPD number, only those at least this similar
+# to the Column E filename are searched after the best one.
+EVIDENCE_NUMBER_TIER_MIN_SIMILARITY = 0.5
+# Last-resort fuzzy filename match: share of the hint's words that must appear.
+EVIDENCE_FUZZY_MIN_COVERAGE = 0.7
 
-    Returns the matched document dict, or None.
+
+def _pipeline_flag(pipeline_config, key, default=True):
+    """Boolean switch read from pipeline_config (dict-like), with a default."""
+    try:
+        value = pipeline_config.get(key, default)
+    except AttributeError:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(value)
+
+
+def _split_filename_hints(filename_hint):
     """
-    documents = (
+    Column E can carry several files in one V/V RECORD FILE NAME cell
+    ("A.pdf B.pdf").  Split on the file extensions so each file is resolved on
+    its own; a single name is returned untouched.
+    """
+    value = normalize_text(filename_hint)
+    if not value:
+        return []
+    parts = [
+        m.group(0).strip()
+        for m in re.finditer(rf"\S.*?\.{_EVIDENCE_FILE_EXT}(?=\s|$)", value, re.IGNORECASE)
+    ]
+    return parts if len(parts) > 1 else [value]
+
+
+def _name_tokens(value):
+    """Meaningful words of a file name (no NPD no., revision words, bare digits)."""
+    return [
+        token for token in _filename_stem(value).split()
+        if not re.fullmatch(r"npd\d+|rev(?:ision)?|copy|v(?:ersion)?|\d+", token)
+    ]
+
+
+def _name_similarity(left, right):
+    a, b = set(_name_tokens(left)), set(_name_tokens(right))
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _document_numbers(document):
+    """Every NPD number found in a document's name / original file name."""
+    numbers = set()
+    for key in ("document_name", "originalfilename"):
+        for match in DOC_NUMBER_PATTERN.findall(str((document or {}).get(key) or "")):
+            numbers.add(match.upper())
+    return numbers
+
+
+def _resolve_evidence_documents(edo_document, filename_hint, doc_number=None):
+    """
+    Resolves a Column E code to EVERY candidate evidence document, best first,
+    as [(document, tier)] with tier in {"exact", "number", "fuzzy"}.
+
+      1. "exact"  - V/V RECORD FILE NAME equals the document name (copy numbers,
+                    revision words and separators ignored).  If found, ONLY these
+                    are returned (a differently named report is never substituted).
+      2. "number" - the V/V RECORD LOCATION / filename NPD number (e.g. NPD54167)
+                    is inside the document name.  This is the case where the
+                    traceability filename is "TDR for Optimus ..." but the
+                    evidence document is "NPD54167-TDR for optimus ...".  When
+                    several documents share the number they are ranked by name
+                    similarity; weaker ones are only kept above a threshold.
+      3. "fuzzy"  - last resort word-overlap match on the filename.
+    """
+    pool = (
         (edo_document or {}).get("evidence_candidate_documents")
         or (edo_document or {}).get("edo_ver_documents")
         or []
     )
-    hint_stem = _filename_stem(filename_hint)
+    hints = _split_filename_hints(filename_hint)
+    results, seen = [], set()
 
-    # The RTM's V/V RECORD FILE NAME is the authoritative source selected
-    # by Call 7.  When it is available, it is a strict identity boundary:
-    # do not substitute a differently named report merely because it shares
-    # a document number or several words with the correct report.
-    if hint_stem:
-        if not documents:
-            return None
-        for document in documents:
+    def _add(document, tier):
+        if id(document) not in seen:
+            seen.add(id(document))
+            results.append((document, tier))
+
+    # ---- 1. exact filename -------------------------------------------------
+    for hint in hints:
+        for document in pool:
             if (
-                _same_evidence_source_filename(filename_hint, document.get("document_name"))
-                or _same_evidence_source_filename(filename_hint, document.get("originalfilename"))
+                _same_evidence_source_filename(hint, document.get("document_name"))
+                or _same_evidence_source_filename(hint, document.get("originalfilename"))
             ):
-                return document
-        return None
+                _add(document, "exact")
+    if results:
+        return results
 
-    if doc_number:
-        by_number = (edo_document or {}).get("documents_by_number") or {}
-        exact_match = by_number.get(normalize_text(doc_number).upper())
-        if exact_match:
-            return exact_match
+    # ---- 2. document number inside the document name -----------------------
+    numbers = []
+    for candidate in [doc_number] + [_extract_doc_number(h) for h in hints]:
+        candidate = normalize_text(candidate).upper()
+        if candidate and candidate not in numbers:
+            numbers.append(candidate)
 
-    if not documents or not hint_stem:
-        return None
+    def _score(document):
+        if not hints:
+            return 1.0
+        return max(
+            max(
+                _name_similarity(h, document.get("document_name") or ""),
+                _name_similarity(h, document.get("originalfilename") or ""),
+            )
+            for h in hints
+        )
 
-    hint_tokens = set(hint_stem.split())
+    by_number = (edo_document or {}).get("documents_by_number") or {}
+    for number in numbers:
+        matches = [d for d in pool if number in _document_numbers(d)]
+        if not matches and by_number.get(number) is not None:
+            matches = [by_number[number]]
+        ranked = sorted(matches, key=_score, reverse=True)
+        for index, document in enumerate(ranked):
+            if index == 0 or not hints or _score(document) >= EVIDENCE_NUMBER_TIER_MIN_SIMILARITY:
+                _add(document, "number")
+    if results:
+        return results
 
-    best_match = None
-    best_score = 0
-
-    for document in documents:
-        doc_stem = _filename_stem(document.get("document_name"))
-        if not doc_stem:
+    # ---- 3. fuzzy filename (last resort) -----------------------------------
+    for hint in hints:
+        hint_tokens = set(_name_tokens(hint))
+        if not hint_tokens:
             continue
+        best, best_overlap = None, 0
+        for document in pool:
+            doc_tokens = set(_name_tokens(document.get("document_name") or document.get("originalfilename") or ""))
+            overlap = hint_tokens & doc_tokens
+            if overlap and len(overlap) / len(hint_tokens) >= EVIDENCE_FUZZY_MIN_COVERAGE and len(overlap) > best_overlap:
+                best, best_overlap = document, len(overlap)
+        if best is not None:
+            _add(best, "fuzzy")
+    return results
 
-        doc_tokens = set(doc_stem.split())
-        overlap = hint_tokens & doc_tokens
 
-        # Require the hint to be substantially contained in the doc name
-        # (or vice versa) - not just a couple of stray shared words.
-        if not overlap:
-            continue
-        coverage = len(overlap) / len(hint_tokens)
-        if coverage < 0.6:
-            continue
+def find_verification_evidence_documents(edo_document, filename_hint, doc_number=None):
+    """Every candidate evidence document for a Column E entry, best first."""
+    return [d for d, _tier in _resolve_evidence_documents(edo_document, filename_hint, doc_number)]
 
-        score = len(overlap)
-        if score > best_score:
-            best_score = score
-            best_match = document
 
-    return best_match
+def find_verification_evidence_document(edo_document, filename_hint, doc_number=None):
+    """
+    Best evidence document for a Column E entry, or None (see
+    _resolve_evidence_documents() for the exact -> number -> fuzzy order).
+
+    BUGFIX: the old version returned None as soon as Column E carried ANY
+    filename that did not match a document name word-for-word - it never
+    reached the document-number lookup.  So DRS-1002 ("NPD54167, Rev 1 - TDR for
+    Optimus Compliance Report ...") never found "NPD54167-TDR for optimus ...",
+    and DRS-216 (NPD37756) never found its report, so no CALL 8 prompt was ever
+    sent and Column F printed "Condition Met: None".
+    """
+    resolved = _resolve_evidence_documents(edo_document, filename_hint, doc_number)
+    return resolved[0][0] if resolved else None
 
 
 VERIFICATION_EVIDENCE_MAX_RESULTS = 60  # was 25 - too shallow for documents with 40+ codes
@@ -6850,10 +7650,12 @@ def _code_text_variants(code):
 def _query_verification_evidence_document(pipeline_config, document, code):
     """
     Retrieves evidence with the exact code first, then one delimiter
-    variant, followed by the existing unfiltered fallback.  Running every
-    spelling/case variant concurrently caused each missing code to create
-    up to eleven LLM requests even though only the first usable result was
-    ever read.
+    variant, followed by the unfiltered fallback.
+
+    CHANGED: when the code-filtered retrieval returned chunks but the LLM still
+    produced no usable Evidence, ONE unfiltered retrieval is tried as well
+    (the code may be written differently in the document, e.g. in a table).
+    Errors are logged instead of silently swallowed.
     """
     target_text = f"Verification_Reference : {code}"
 
@@ -6871,6 +7673,7 @@ def _query_verification_evidence_document(pipeline_config, document, code):
         return execute_llm_retry(pipeline_config, document["collection"], prompt_row)
 
     docs, metadata, response = [], None, ""
+    ran_unfiltered = False
 
     try:
         try:
@@ -6887,15 +7690,25 @@ def _query_verification_evidence_document(pipeline_config, document, code):
                 break
 
         if not docs:
-            pass
             docs, metadata, response = _run("", max_results=VERIFICATION_EVIDENCE_MAX_RESULTS * 2)
+            ran_unfiltered = True
 
-        pass
+        fields = parse_verification_evidence_fields(response)
+
+        if (
+            not ran_unfiltered
+            and not is_meaningful_evidence_field(fields.get("evidence", ""))
+            and _pipeline_flag(pipeline_config, "verification_evidence_unfiltered_retry", True)
+        ):
+            _docs2, _meta2, response2 = _run("", max_results=VERIFICATION_EVIDENCE_MAX_RESULTS * 2)
+            fields2 = parse_verification_evidence_fields(response2)
+            if is_meaningful_evidence_field(fields2.get("evidence", "")):
+                return fields2, response2
     except Exception as e:
-        pass
+        logging.warning("CALL 8 evidence query failed | code=%s | document=%s | error=%s",
+                        code, (document or {}).get("document_name"), e)
         return {}, ""
 
-    fields = parse_verification_evidence_fields(response)
     return fields, response
 
 
@@ -6967,25 +7780,310 @@ def format_verification_evidence_block(code, filename_hint, fields):
 
 
 
-def extract_and_apply_verification_evidence(pipeline_config, edo_document, final_edos):
+# Max number of "standard text" probes per file (each probe = one retrieval + LLM call).
+VERIFICATION_EVIDENCE_STANDARD_VARIANT_LIMIT = 3
+
+STANDARD_EVIDENCE_PROMPT_ADDENDUM = """
+
+ADDITIONAL INSTRUCTIONS - STANDARD-BASED SEARCH:
+
+This document was selected because its file name carries the standard that the
+requirement is verified against. The requirement code itself may NOT appear
+verbatim in the document. Look for evidence in this order and stop at the
+first that applies:
+
+1. The requirement code ({code}) - exact text or a spelling variant.
+
+2. The standard ({standards}) - a clause, section, test or result that
+   addresses this standard together with what the requirement describes.
+
+3. The EDO description below - text whose subject matches that description.
+
+Rules for this search:
+- Only extract text that verifies THIS requirement: the same standard AND the
+  same subject as the EDO description. Do not return generic text about the
+  standard that does not relate to the requirement.
+- Copy the evidence verbatim. Do not paraphrase, summarize or infer.
+- If nothing in the document supports the requirement, leave Evidence as None.
+- Keep the same Output Format as above.
+"""
+
+
+def _standard_text_variants(standards):
+    """
+    Text forms of each standard that may appear INSIDE a document, used as
+    $contains probes: "IEC 60601-1: 2005" -> "IEC 60601-1", "IEC60601-1",
+    "60601-1". The trailing year is dropped (reports often omit it).
+    """
+    variants, seen = [], set()
+    for standard in standards:
+        base = re.sub(r"[\s:,\-]*(?:19|20)\d{2}\s*$", "", normalize_text(standard)).strip()
+        number_part = re.sub(r"^[A-Za-z/\s]+", "", base).strip()
+        for variant in (base, re.sub(r"\s+", "", base), number_part):
+            if len(variant) >= 4 and variant not in seen:
+                seen.add(variant)
+                variants.append(variant)
+    return variants
+
+
+def _query_verification_evidence_by_standard(
+    pipeline_config, document, code, standards, edo_description
+):
+    """
+    CALL 8 standards fallback - the search INSIDE one document that was picked
+    by its file name. Returns (fields, raw_response, matched_by) and stops at
+    the first attempt that yields real evidence:
+
+      1. "code"        - retrieval filtered on the code text (as the normal path)
+      2. "standard"    - retrieval filtered on the standard text
+      3. "description" - unfiltered retrieval driven by the EDO description
+
+    The prompt carries the code, the standard and the EDO description so the
+    LLM can match the requirement even when the code is not written in the
+    document.
+    """
+    standard_text = "; ".join(standards)
+    description = normalize_text(edo_description)[:600]
+
+    target_text = f"Verification_Reference : {code}\nStandard : {standard_text}"
+    if description:
+        target_text += f"\nEDO_Description : {description}"
+
+    prompt_text = (
+        VERIFICATION_EVIDENCE_PROMPT_TEXT
+        + STANDARD_EVIDENCE_PROMPT_ADDENDUM.format(code=code, standards=standard_text)
+        + "\nTARGETS:\n" + target_text
+    )
+
+    question = (
+        f"For requirement code {code}, verified against {standard_text}, find where "
+        f"this document verifies it, state whether it Passed or Failed, and quote "
+        f"the exact evidence."
+    )
+    if description:
+        question += f" The requirement is described as: {description}"
+
+    def _run(where_document, max_results=VERIFICATION_EVIDENCE_MAX_RESULTS):
+        prompt_row = {
+            "prompt_role": VERIFICATION_EVIDENCE_PROMPT_ROLE,
+            "prompt_text": prompt_text,
+            "question": question,
+            "fulltext": "Yes",
+            "where_filter": "",
+            "where_document": where_document,
+            "checkpoint": f"Retrieve verification evidence for {code} by standard {standard_text}",
+            "max_results": max_results
+        }
+        return execute_llm_retry(pipeline_config, document["collection"], prompt_row)
+
+    try:
+        code_limit = max(1, int(pipeline_config.get(
+            "verification_evidence_variant_limit", VERIFICATION_EVIDENCE_VARIANT_LIMIT
+        )))
+    except (AttributeError, TypeError, ValueError):
+        code_limit = VERIFICATION_EVIDENCE_VARIANT_LIMIT
+
+    attempts = [("code", json.dumps({"$contains": v})) for v in _code_text_variants(code)[:code_limit]]
+    attempts += [
+        ("standard", json.dumps({"$contains": v}))
+        for v in _standard_text_variants(standards)[:VERIFICATION_EVIDENCE_STANDARD_VARIANT_LIMIT]
+    ]
+    attempts.append(("description", ""))
+
+    for matched_by, where_document in attempts:
+        try:
+            max_results = (
+                VERIFICATION_EVIDENCE_MAX_RESULTS * 2 if not where_document
+                else VERIFICATION_EVIDENCE_MAX_RESULTS
+            )
+            docs, _metadata, response = _run(where_document, max_results)
+        except Exception:
+            continue
+        if not docs:
+            continue
+        fields = parse_verification_evidence_fields(response)
+        if is_meaningful_evidence_field(fields.get("evidence", "")):
+            return fields, response, matched_by
+
+    return {}, "", ""
+
+
+def parse_reference_codes_with_standards(raw_text, codes):
+    """
+    Turns the LLM's "Reference code with standards" string, e.g.
+        "(DRS-808 ISO 18562-1: 2017, DRS-809 ISO 18562-3: 2017)"
+    into {normalize_id(code): [standard, ...]} for the given `codes`.
+
+    The codes of the EDO are located inside the string; the text between a
+    code and the next code is that code's standard (several standards for
+    one code may be separated by ";", "&" or "and").
+    """
+    text = normalize_text(raw_text)
+    if not text or not codes:
+        return {}
+    if (text[0], text[-1]) in (("(", ")"), ("[", "]")):
+        text = text[1:-1].strip()
+
+    spans = []
+    for code in sorted({normalize_text(c) for c in codes if normalize_text(c)}, key=len, reverse=True):
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(code) + r"(?![A-Za-z0-9])"
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            if any(match.start() < end and match.end() > start for start, end, _ in spans):
+                continue
+            spans.append((match.start(), match.end(), code))
+    spans.sort()
+
+    result = {}
+    for index, (_, end, code) in enumerate(spans):
+        next_start = spans[index + 1][0] if index + 1 < len(spans) else len(text)
+        segment = text[end:next_start].strip().strip(",;").strip()
+        segment = re.sub(r"^[\s:\-=]+", "", segment).strip()
+        standards = [
+            s.strip() for s in re.split(r"\s*(?:;|&|\band\b)\s*", segment, flags=re.IGNORECASE)
+            if s.strip()
+        ]
+        if standards:
+            result.setdefault(normalize_id(code), standards)
+    return result
+
+
+def _standard_filename_pattern(standard, drop_year=False, family_only=False):
+    """
+    Regex that finds `standard` (e.g. "ISO 18562-1: 2017") inside a file name,
+    ignoring separator style (space / _ / - / : / /). The match must not run
+    into a longer standard number: "ISO 10993-1" must not match
+    "ISO 10993-10" and "IEC 60601-1" must not match "IEC 60601-1-2", while a
+    trailing year ("... 2017") is still allowed.
+
+    family_only=True matches just the standard FAMILY - the prefix plus the
+    main number, without the part ("IEC 60601-1" -> "iec60601") - so a file
+    named "..._iec60601_Security.pdf" is found. Even then a file that names a
+    DIFFERENT part ("iec60601_1_2", "iec60601_2") is rejected by the trailing
+    lookahead below.
+    """
+    tokens = [tok.strip(".") for tok in re.split(r"[^A-Za-z0-9.]+", normalize_text(standard))]
+    tokens = [tok for tok in tokens if tok]
+    if drop_year and len(tokens) > 1 and re.fullmatch(r"(?:19|20)\d{2}", tokens[-1]):
+        tokens = tokens[:-1]
+    if family_only:
+        family = []
+        for tok in tokens:
+            main_number = re.match(r"\d{3,}", tok)
+            family.append(main_number.group(0) if main_number else tok)
+            if main_number:
+                break
+        else:
+            return None            # no main standard number found
+        tokens = family
+    if not tokens:
+        return None
+    body = r"[\s_:/\-]*".join(re.escape(tok) for tok in tokens)
+    return re.compile(
+        r"(?<![A-Za-z0-9])" + body
+        + r"(?!\d)(?!\.\d)(?![\s_:/\-]+(?!(?:19|20)\d{2}(?!\d))\d)",
+        re.IGNORECASE,
+    )
+
+
+def find_evidence_documents_by_standards(edo_document, standards):
+    """
+    EVERY evidence document whose file name contains one of `standards`
+    (same document pool CALL 8 normally searches). All file names are checked;
+    best match first:
+      1. exact standard including its year      "iec 60601-1 2005"
+      2. the standard without / with another year  "iec60601_1u_2023-08-24"
+      3. only the standard family, no part number  "iec60601_Security"
+         (files that name a different part are never taken)
+    """
+    documents = (
+        (edo_document or {}).get("evidence_candidate_documents")
+        or (edo_document or {}).get("edo_ver_documents")
+        or []
+    )
+    matched, seen = [], set()
+    for drop_year, family_only in ((False, False), (True, False), (True, True)):
+        for standard in standards:
+            pattern = _standard_filename_pattern(
+                standard, drop_year=drop_year, family_only=family_only
+            )
+            if not pattern:
+                continue
+            for document in documents:
+                names = (document.get("document_name"), document.get("originalfilename"))
+                if not any(pattern.search(normalize_text(name)) for name in names if name):
+                    continue
+                doc_id = normalize_text(document.get("document_name")) or id(document)
+                if doc_id not in seen:
+                    seen.add(doc_id)
+                    matched.append(document)
+
+    print("code which has standards records in it:",matched)
+    return matched
+
+
+NEXT_REVISION_TRACE_QUESTION = (
+    "Find ALL {code} records where RECORD STATUS is Current. Return EVERY Current row "
+    "for this REQ TAG, one JSON object per physical row, for every revision found in "
+    "V/V RECORD LOCATION - do not keep only the highest revision, a lower revision is "
+    "needed when the highest one has no evidence. Return valid JSON only."
+)
+
+
+def _requery_next_revision_records(pipeline_config, edo_document, code, project_code):
+    """
+    Calls CALL 7 again for ONE code and returns every Current record, next
+    revision first, as alternate dicts (prefix / filename / location /
+    doc_number).  Used by CALL 8 when the highest-revision document has no
+    evidence and the first CALL 7 pass kept no lower revision.
+    """
+    prompt_data = (edo_document or {}).get("trace_prompt_data")
+    documents = _get_traceability_documents(edo_document)
+    if not prompt_data or not documents:
+        return []
+
+    candidates = []
+    for doc_index, doc in enumerate(documents):
+        collection = doc.get("collection")
+        if not collection:
+            continue
+        doc_name = _traceability_document_name(doc) or f"EDO_TM document #{doc_index}"
+        try:
+            rows_by_code = _query_traceability_details_batch(
+                pipeline_config, collection, prompt_data, [code], project_code,
+                source_document_name=doc_name,
+                question_override=NEXT_REVISION_TRACE_QUESTION.format(code=code),
+            )
+        except Exception as e:
+            logging.warning("CALL 8 next-revision re-query failed | code=%s | doc=%s | %s", code, doc_name, e)
+            continue
+        for row in rows_by_code.get(code, []):
+            if _has_real_traceability_content(row):
+                candidates.append({"row": row, "document_index": doc_index, "document_name": doc_name})
+
+    return [_alternate_record_from_entry(e, code) for e in _rank_alternate_entries(candidates)]
+
+
+def extract_and_apply_verification_evidence(pipeline_config, edo_document, final_edos, db=None):
     """
     CALL 8 - runs on the fully merged, traceability-resolved final_edos
     list (Existing + New), AFTER build_final_edos_with_traceability()
     (CALL 7).
 
-    CHANGED: added a run-scoped success-only cache keyed by
-    (resolved_document_name, code). A code that appears in many EDO
-    records (e.g. SRS-CTRL-130 appearing in 10 different rows) is only
-    ever a genuine retrieval question ONCE - if it succeeds on ANY
-    occurrence, every other occurrence reuses that same correct answer
-    instead of re-rolling retrieval independently and risking a worse
-    result. A failed/empty result is NEVER cached, so later occurrences
-    of the same code keep trying instead of being locked into "None".
-    A one-time immediate retry is also added when the first attempt
-    comes back non-meaningful. After the main loop, a backfill pass
-    goes back over every record and replaces any remaining "None" block
-    whose (document, code) key was successfully resolved LATER in the
-    run - so earlier rows benefit from a success found afterwards too.
+    Evidence search order for every Column E code:
+      1. the document(s) named by CALL 7's highest-revision record - resolved by
+         exact filename, then by document NUMBER (NPD54167 inside
+         "NPD54167-TDR for optimus ..."), then fuzzy name;
+      2. NEXT-REVISION records of the same code (kept from CALL 7, or - if none
+         were kept - fetched by calling CALL 7 again), highest remaining revision
+         first, each resolved the same way;
+      3. the standards fallback (file names carrying the standard).
+    The first document that yields real evidence wins.  When it is not the
+    original Column E document, Column E is rewritten to the record/document
+    that actually supplied the evidence.
+
+    A run-scoped success-only cache keyed by (resolved_document_name, code)
+    is kept exactly as before; a failed/empty result is never cached, and a
+    backfill pass replaces remaining "None" blocks that succeeded later.
     """
     if not final_edos:
         return final_edos
@@ -7013,38 +8111,20 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
                 )
         return final_edos
 
-    # OPTIMIZATION (speed only - selection/caching/retry logic unchanged):
-    # the previous version ran ONE full retrieval+LLM round trip per
-    # (edo, pair) STRICTLY sequentially, only skipping the call outright
-    # on an exact cache hit. Since most of the wall-clock cost here is
-    # network/LLM wait time, not CPU work, this is restructured into
-    # three passes that do the exact same work, just not one-item-at-a-
-    # time:
-    #   Pass 1 (fast, no I/O): walk every (edo, pair) once, resolve its
-    #     matched_document + cache_key (no LLM calls here at all), and
-    #     build the deduplicated set of UNIQUE cache_keys that actually
-    #     need a real query - this is identical to what the cache check
-    #     used to filter out, just done up front instead of inline.
-    #   Pass 2 (concurrent I/O): fire the queries for every unique
-    #     cache_key at once via a thread pool, applying the SAME
-    #     one-immediate-retry-on-empty rule as before, per key.
-    #   Pass 3 (fast, no I/O): re-walk every (edo, pair) in original
-    #     order and assemble each record's blocks from the Pass 2
-    #     results dict - identical assembly/formatting logic and
-    #     ordering as the old inline version.
-    # The set of LLM calls made, their inputs, the retry rule, the
-    # cache-population rule (success-only), and the final block text
-    # are all unchanged - only the scheduling is different.
+    requery_enabled = _pipeline_flag(pipeline_config, "evidence_requery_next_revision", True)
+    can_requery = bool(
+        requery_enabled
+        and _get_traceability_documents(edo_document)
+        and (edo_document or {}).get("trace_prompt_data")
+    )
+    update_column_e = _pipeline_flag(pipeline_config, "verification_update_column_e", True)
+
     evidence_cache = {}
     cache_lock = threading.Lock()
 
-    # ---- Pass 1: resolve documents/cache_keys, no LLM calls ----
-    # per_edo_pairs[i] holds, for final_edos[i], the list of
-    # (code, filename_hint, resolved_document_name, matched_document,
-    # cache_key) tuples it needs - "None" matched_document entries
-    # (skipped exactly like the old `continue`) are simply omitted.
+    # ---- Pass 1: resolve documents / cache keys (no LLM calls) ----
     per_edo_pairs = []
-    unique_tasks = {}  # cache_key -> (matched_document, code, resolved_document_name)
+    unique_tasks = {}  # cache_key -> task dict
 
     for edo in final_edos:
         code_filename_pairs = parse_verification_reference_code_filename_pairs(edo)
@@ -7055,42 +8135,37 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
             per_edo_pairs.append(resolved_pairs)
             continue
 
+        standards_by_code = parse_reference_codes_with_standards(
+            edo.get("reference_code_with_standards"),
+            [pair["code"] for pair in code_filename_pairs]
+        )
+        edo_description_text = normalize_text(edo.get("edo_description"))
+        if not edo_description_text:
+            for element in edo.get("design_elements") or []:
+                edo_description_text = normalize_text((element or {}).get("description"))
+                if edo_description_text:
+                    break
+
+        alternates_by_code = edo.get("verification_alternate_records") or {}
+        project_code = edo.get("Project_code", "")
+
         for pair in code_filename_pairs:
             code = pair["code"]
             filename_hint = pair["filename"]
             doc_number = pair.get("doc_number")
             trace_status = normalize_text(trace_statuses.get(code)).lower()
-            is_terminal_trace = trace_status in {
-                "superseded", "unverified", "no current record"
-            }
 
-            # Superseded is a final traceability result, not a missing
-            # evidence document.  Keep its position in Column F but do not
-            # resolve or query any test report for it.
-            if is_terminal_trace:
-                resolved_pairs.append((code, "", "N/A", None, None, True))
+            # Superseded / unverified is a final traceability result: keep its
+            # position in Column F but never query a report for it.
+            if trace_status in {"superseded", "unverified", "no current record"}:
+                resolved_pairs.append({"terminal": True, "code": code})
                 continue
 
-            matched_document = None
-
-            # ----------------------------------------------------------
-            # Only try document resolution when CALL 7 actually gave
-            # us something that can be used for lookup.
-            # ----------------------------------------------------------
+            resolved_docs = []
             if filename_hint or doc_number:
-                matched_document = find_verification_evidence_document(
-                    edo_document,
-                    filename_hint,
-                    doc_number=doc_number
-                )
+                resolved_docs = _resolve_evidence_documents(edo_document, filename_hint, doc_number)
+            matched_document = resolved_docs[0][0] if resolved_docs else None
 
-            # ----------------------------------------------------------
-            # IMPORTANT:
-            # NEVER skip the code.
-            #
-            # If the source document cannot be found, we still create
-            # a CALL 8 result for this code.
-            # ----------------------------------------------------------
             if matched_document:
                 resolved_document_name = (
                     normalize_text(matched_document.get("document_name"))
@@ -7098,40 +8173,48 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
                     or "None"
                 )
             else:
-                resolved_document_name = (
-                    filename_hint
-                    or "No document found"
+                resolved_document_name = filename_hint or "No document found"
+
+            cache_key = (resolved_document_name, normalize_id(code))
+
+            code_standards = standards_by_code.get(normalize_id(code), [])
+            if code_standards and not matched_document:
+                cache_key = (
+                    "STANDARD",
+                    normalize_id(code),
+                    "|".join(normalize_id(s) for s in code_standards),
+                    normalize_id(edo_description_text)[:200],
                 )
 
-            # Use a unique cache key even when no document exists.
-            cache_key = (
-                resolved_document_name,
-                normalize_id(code)
+            alternates = alternates_by_code.get(code) or []
+
+            logging.info(
+                "CALL 8 resolve | code=%s | column_E_filename=%r | doc_number=%s | matched=%s | "
+                "next_revision_records_kept=%s | standards=%s",
+                code, filename_hint, doc_number,
+                [(normalize_text(d.get("document_name")), tier) for d, tier in resolved_docs],
+                len(alternates), code_standards,
             )
 
-            resolved_pairs.append(
-                (
-                    code,
-                    filename_hint,
-                    resolved_document_name,
-                    matched_document,
-                    cache_key,
-                    False,
-                )
-            )
+            resolved_pairs.append({
+                "terminal": False,
+                "code": code,
+                "cache_key": cache_key,
+                "resolved_document_name": resolved_document_name,
+            })
 
-            # Only documents that actually exist can be sent to the LLM.
-            # But the code itself is NEVER skipped.
-            if (
-                matched_document
-                and cache_key not in evidence_cache
-                and cache_key not in unique_tasks
+            if cache_key not in unique_tasks and (
+                resolved_docs or alternates or code_standards or can_requery
             ):
-                unique_tasks[cache_key] = (
-                    matched_document,
-                    code,
-                    resolved_document_name
-                )
+                unique_tasks[cache_key] = {
+                    "code": code,
+                    "documents": resolved_docs,
+                    "alternates": list(alternates),
+                    "standards": code_standards,
+                    "description": edo_description_text,
+                    "project_code": project_code,
+                    "resolved_document_name": resolved_document_name,
+                }
 
         per_edo_pairs.append(resolved_pairs)
 
@@ -7145,68 +8228,822 @@ def extract_and_apply_verification_evidence(pipeline_config, edo_document, final
         )
 
     # ---- Pass 2: run every unique task concurrently ----
-    def _run_task(cache_key, matched_document, code, resolved_document_name):
-        fields, raw_response = _query_verification_evidence_document(
-            pipeline_config, matched_document, code
-        )
-
-        # ---- Same one-immediate-retry-on-empty rule as before ----
-        if not is_meaningful_evidence_field(fields.get("evidence", "")):
-            retry_fields, retry_raw = _query_verification_evidence_document(
-                pipeline_config, matched_document, code
+    def _search_documents(documents, code, tried, trail=None, stage=""):
+        """First document (not tried yet) that yields real evidence."""
+        for document in documents:
+            if id(document) in tried:
+                continue
+            tried.add(id(document))
+            if trail is not None:
+                trail.append(f"{normalize_text(document.get('document_name')) or 'unnamed document'} [{stage}]")
+            fields, raw_response = _query_verification_evidence_document(
+                pipeline_config, document, code
             )
-            if is_meaningful_evidence_field(retry_fields.get("evidence", "")):
-                fields, raw_response = retry_fields, retry_raw
+            if not is_meaningful_evidence_field(fields.get("evidence", "")):
+                # Same one-immediate-retry-on-empty rule as before.
+                retry_fields, retry_raw = _query_verification_evidence_document(
+                    pipeline_config, document, code
+                )
+                if is_meaningful_evidence_field(retry_fields.get("evidence", "")):
+                    fields, raw_response = retry_fields, retry_raw
+            if is_meaningful_evidence_field(fields.get("evidence", "")):
+                return document, fields, raw_response
+        return None, {}, ""
 
-        block = format_verification_evidence_block(code, resolved_document_name, fields)
+    def _search_by_standards(code, standards, description):
+        """Standards fallback: first evidence file named after the standard that yields evidence."""
+        documents = find_evidence_documents_by_standards(edo_document, standards)
+        logging.info(
+            "CALL 8 [Standards fallback] code=%s | standards=%s | candidate files=%s",
+            code, standards,
+            [normalize_text(d.get("document_name")) for d in documents]
+        )
+        searched = []
+        for document in documents:
+            document_name = normalize_text(document.get("document_name")) or "None"
+            fields, raw_response, matched_by = _query_verification_evidence_by_standard(
+                pipeline_config, document, code, standards, description
+            )
+            if is_meaningful_evidence_field(fields.get("evidence", "")):
+                logging.info(
+                    "CALL 8 [Standards fallback] evidence found | code=%s | file=%s | matched_by=%s",
+                    code, document_name, matched_by
+                )
+                return document_name, fields, raw_response, searched
+            searched.append(document_name)
+        logging.info(
+            "CALL 8 [Standards fallback] evidence NOT found | code=%s | searched=%s", code, searched
+        )
+        return None, {}, "", searched
 
-        # ---- Only cache a REAL success - never cache "None" (same rule) ----
+    def _run_task(cache_key, task):
+        code = task["code"]
+        tried = set()
+        trail = []          # every document searched for this code, in order
+        primary_documents = task["documents"]
+
+        # 1) the document(s) of the highest-revision CALL 7 record
+        document, fields, raw_response = _search_documents(
+            [d for d, _tier in primary_documents], code, tried, trail, "Column E record"
+        )
+        tier_of = {id(d): tier for d, tier in primary_documents}
+        used_alternate = None
+
+        # 2) NEXT revision records (kept from CALL 7, else call CALL 7 again)
+        if document is None:
+            alternates = list(task["alternates"])
+            if not alternates and can_requery:
+                alternates = _requery_next_revision_records(
+                    pipeline_config, edo_document, code, task["project_code"]
+                )
+                logging.info(
+                    "CALL 8 next-revision re-query (CALL 7) | code=%s | records=%s",
+                    code, [a.get("prefix") for a in alternates]
+                )
+            for alternate in alternates:
+                alt_resolved = _resolve_evidence_documents(
+                    edo_document, alternate.get("filename"), alternate.get("doc_number")
+                )
+                alt_documents = [d for d, _t in alt_resolved if id(d) not in tried]
+                if not alt_resolved:
+                    trail.append(
+                        f"(document of next revision record {alternate.get('prefix')} "
+                        f"not found in the evidence document list)"
+                    )
+                if not alt_documents:
+                    continue
+                tier_of.update({id(d): t for d, t in alt_resolved})
+                found_doc, found_fields, found_raw = _search_documents(
+                    alt_documents, code, tried, trail,
+                    f"next revision record {alternate.get('prefix')}"
+                )
+                if found_doc is not None:
+                    document, fields, raw_response = found_doc, found_fields, found_raw
+                    used_alternate = alternate
+                    logging.info(
+                        "CALL 8 evidence found in NEXT revision | code=%s | record=%s | file=%s",
+                        code, alternate.get("prefix"), normalize_text(found_doc.get("document_name"))
+                    )
+                    break
+
+        # 3) standards fallback
+        standards_name, searched = None, []
+        if document is None and task["standards"]:
+            standards_name, fields, raw_response, searched = _search_by_standards(
+                code, task["standards"], task["description"]
+            )
+
+        if task["standards"] and document is None:
+            standards_label = ", ".join(task["standards"])
+            trail.extend(
+                f"{n} [standards: {standards_label}]"
+                for n in searched + ([standards_name] if standards_name else [])
+            )
+            if not searched and not standards_name:
+                trail.append(f"(no file named after standards {standards_label} in the evidence document list)")
+
+        if document is not None:
+            block_name = normalize_text(document.get("document_name")) or task["resolved_document_name"]
+        elif standards_name:
+            block_name = standards_name
+        elif task["standards"] and not task["documents"]:
+            block_name = ", ".join(searched) if searched else "No document found"
+        else:
+            block_name = task["resolved_document_name"]
+
+        block = format_verification_evidence_block(code, block_name, fields)
+
+        # Column E follows the document that supplied the evidence (or, with no
+        # evidence at all, the document matched by NUMBER / fuzzy name).
+        e_document = document
+        if e_document is None and primary_documents:
+            e_document = primary_documents[0][0]
+        e_update = bool(
+            e_document is not None
+            and (used_alternate is not None or tier_of.get(id(e_document)) in ("number", "fuzzy"))
+        )
+        logging.info(
+            "CALL 8 search trail | code=%s | evidence_found=%s | documents searched (in order)=%s",
+            code, is_meaningful_evidence_field(fields.get("evidence", "")), trail or ["(none)"]
+        )
+        e_info = {
+            "trail": list(trail),
+            # True when at least one document from the evidence document list was
+            # searched (even if it held no evidence); False = no document found.
+            "document_found": bool(tried) or bool(standards_name) or bool(searched),
+            "e_update": e_update,
+            "e_doc_name": normalize_text((e_document or {}).get("document_name")) if e_document else "",
+            "e_prefix": (used_alternate or {}).get("prefix") if used_alternate else None,
+        }
+
         if is_meaningful_evidence_field(fields.get("evidence", "")):
             with cache_lock:
                 evidence_cache[cache_key] = block
 
-        return cache_key, block, raw_response
+        return cache_key, block, raw_response, e_info
 
-    task_results = {}  # cache_key -> (block, raw_response)
+    task_results = {}  # cache_key -> (block, raw_response, e_info)
 
     if unique_tasks:
         with ThreadPoolExecutor(max_workers=LLM_CALL_MAX_WORKERS) as pool:
             futures = [
-                pool.submit(_run_task, cache_key, matched_document, code, resolved_document_name)
-                for cache_key, (matched_document, code, resolved_document_name) in unique_tasks.items()
+                pool.submit(_run_task, cache_key, task)
+                for cache_key, task in unique_tasks.items()
             ]
             for future in as_completed(futures):
-                cache_key, block, raw_response = future.result()
-                task_results[cache_key] = (block, raw_response)
+                cache_key, block, raw_response, e_info = future.result()
+                task_results[cache_key] = (block, raw_response, e_info)
 
-    # ---- Pass 3: assemble each record's blocks, same order as before ----
+    # ---- Pass 3: assemble each record's blocks (and Column E) ----
     for edo, resolved_pairs in zip(final_edos, per_edo_pairs):
         blocks = []
-        for code, filename_hint, resolved_document_name, matched_document, cache_key, is_superseded in resolved_pairs:
-            if is_superseded:
+        pair_status = []   # aligned with blocks: "terminal" | "found" | "no_document"
+        pair_trail = []    # aligned with blocks: documents searched for that code
+        column_e_lines = [
+            ln.strip()
+            for ln in normalize_text(edo.get("verification_reference")).split("\n")
+            if ln.strip()
+        ]
+        column_e_aligned = len(column_e_lines) == len(resolved_pairs)
+        column_e_changed = False
+
+        for index, pair in enumerate(resolved_pairs):
+            code = pair["code"]
+            if pair["terminal"]:
                 blocks.append(
                     format_verification_evidence_block(code, "N/A", {"evidence": "Fail"})
                 )
                 edo.setdefault("verification_evidence_raw_llm_responses", {})[code] = ""
+                pair_status.append("terminal")
+                pair_trail.append([])
                 continue
+
+            cache_key = pair["cache_key"]
+            e_info = None
             if cache_key in task_results:
-                block, raw_response = task_results[cache_key]
+                block, raw_response, e_info = task_results[cache_key]
             else:
-                # Populated by evidence_cache already (a prior task's
-                # success) before Pass 2 even ran - reuse it exactly as
-                # the old inline cache-hit path did.
-                block = evidence_cache.get(cache_key, format_verification_evidence_block(code, resolved_document_name, {}))
+                block = evidence_cache.get(
+                    cache_key,
+                    format_verification_evidence_block(code, pair["resolved_document_name"], {})
+                )
                 raw_response = ""
 
             blocks.append(block)
             edo.setdefault("verification_evidence_raw_llm_responses", {})[code] = raw_response
+            pair_status.append(
+                "found" if (e_info and e_info.get("document_found")) else "no_document"
+            )
+            pair_trail.append((e_info or {}).get("trail") or [])
+
+            if update_column_e and column_e_aligned and e_info and e_info["e_update"] and e_info["e_doc_name"]:
+                line = column_e_lines[index]
+                prefix = e_info["e_prefix"] or (line.rpartition(" - ")[0] if " - " in line else line)
+                new_line = f"{prefix} - {e_info['e_doc_name']}"
+                if new_line != line:
+                    column_e_lines[index] = new_line
+                    column_e_changed = True
 
         edo["verification_evidence"] = "\n\n".join(blocks)
+        edo["evidence_pair_status"] = pair_status
+        edo["evidence_pair_trail"] = pair_trail
+        if column_e_changed:
+            edo["verification_reference"] = "\n".join(column_e_lines)
 
     # ---- Backfill pass: fix earlier records whose code later succeeded ----
     final_edos = backfill_evidence_from_cache(final_edos, evidence_cache, edo_document)
+    # CALL 8B: folder-based fallback for codes still showing "None" / not found
+    final_edos = apply_folder_fallback_evidence(pipeline_config, edo_document, final_edos, db)
+    final_edos = attach_evidence_not_found_remarks(final_edos)
+
+    print("evidence which has standards in it:",final_edos)
+    return final_edos
+
+# ==========================================================
+# CALL 8B: FOLDER-BASED FALLBACK FOR "NONE" / NOT-FOUND EVIDENCE
+# ==========================================================
+# Runs at the END of CALL 8, only for codes whose Column F block still
+# says "Condition Met: None" (or whose CALL 7 trace was not found at all).
+#
+#   STEP 1  File_path  = "uploaded_filepath" read from the DB using the
+#           document number (NPD##### / LR00#####) that CALL 7 produced.
+#           The folder of that path is the search area.
+#   STEP 2  Open EVERY document in that folder (pdf / docx / xlsx / txt)
+#           and look for the code. The first document that really holds
+#           evidence wins: Column E is rewritten to
+#           "<code> <document number> - <file name>" and a remark is
+#           written to Column M.
+#   STEP 3  Still nothing -> standards flow: every file in the same
+#           folder whose FILE NAME carries the code's standard (or whose
+#           document number matches) is opened and searched the same way.
+#           Column E + remark are rewritten for the document that is used.
+
+FOLDER_FALLBACK_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".xlsm", ".txt", ".csv", ".md")
+FOLDER_FALLBACK_MAX_FILES = 300            # safety cap per folder
+FOLDER_FALLBACK_MAX_CHARS = 3_000_000      # safety cap per file
+FOLDER_FALLBACK_CONTEXT_BEFORE = 600
+FOLDER_FALLBACK_CONTEXT_AFTER = 1400
+FOLDER_FALLBACK_MAX_WINDOWS = 4
+
+# NPD##### and LR00##### style document numbers.
+FOLDER_DOC_NUMBER_PATTERN = re.compile(
+    r'(?<![A-Za-z0-9])(?:NPD\s*-?\s*\d{4,}|LR\s*-?\s*\d{5,})(?!\d)', re.IGNORECASE
+)
+
+FOLDER_TRACE_FOUND_REMARK = (
+    "The trace for the code {code} was found in this document {document}."
+)
+FOLDER_TRACE_STANDARD_FOUND_REMARK = (
+    "The trace for the code {code} was found using the standard {standard} "
+    "in this document {document}."
+)
+
+_FOLDER_TEXT_CACHE = {}
+_FOLDER_TEXT_LOCK = threading.Lock()
+_UPLOADED_FILEPATH_CACHE = {}
+_UPLOADED_FILEPATH_LOCK = threading.Lock()
+
+
+def _extract_folder_doc_numbers(value):
+    """Every NPD##### / LR##### number inside `value`, upper-cased, no spaces, in order."""
+    numbers = []
+    for match in FOLDER_DOC_NUMBER_PATTERN.finditer(normalize_text(value)):
+        number = re.sub(r"[\s-]+", "", match.group(0)).upper()
+        if number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
+# ---------------------------------------------------------- STEP 1 (DB)
+def _document_dict_filepath(document):
+    """'uploaded_filepath' if a loaded document dict already carries it (any key casing)."""
+    if not isinstance(document, dict):
+        return ""
+    for key, value in document.items():
+        if normalize_text(key).lower().replace("_", "") == "uploadedfilepath" and normalize_text(value):
+            return normalize_text(value)
+    return ""
+
+
+def get_uploaded_file_path(db, edo_document, pipeline_config, document_number):
+    """
+    STEP 1 - returns the DB column "uploaded_filepath" for `document_number`
+    (NPD##### or LR00#####), or "" when it cannot be found.
+
+    Lookup order:
+      a. documents already loaded by get_edo_document() (when the
+         template-documents query already returns an uploaded_filepath column);
+      b. pipeline_config["uploaded_filepath_lookup"] - optional callable(number) -> str;
+      c. a DatabaseHandler method - pipeline_config["uploaded_filepath_db_method"]
+         or one of the names in _UPLOADED_FILEPATH_DB_METHODS.
+    """
+    number = re.sub(r"[\s-]+", "", normalize_text(document_number)).upper()
+    if not number:
+        return ""
+    with _UPLOADED_FILEPATH_LOCK:
+        if number in _UPLOADED_FILEPATH_CACHE:
+            return _UPLOADED_FILEPATH_CACHE[number]
+
+    path = ""
+
+    # a. already-loaded document metadata
+    pools = []
+    if edo_document:
+        pools.extend((edo_document.get("documents_by_number") or {}).values())
+        pools.extend(edo_document.get("evidence_candidate_documents") or [])
+        pools.extend(edo_document.get("traceability_documents") or [])
+    for document in pools:
+        name_numbers = _extract_folder_doc_numbers(
+            f"{document.get('document_name') or ''} {document.get('originalfilename') or ''}"
+        )
+        if number in name_numbers:
+            path = _document_dict_filepath(document)
+            if path:
+                break
+
+    # b. user supplied callable
+    if not path:
+        lookup = (pipeline_config or {}).get("uploaded_filepath_lookup") if hasattr(pipeline_config, "get") else None
+        if callable(lookup):
+            try:
+                path = normalize_text(lookup(number))
+            except Exception:
+                logging.exception("uploaded_filepath_lookup failed for %s", number)
+
+    # c. DatabaseHandler method
+    if not path and db is not None:
+        configured = (pipeline_config or {}).get("uploaded_filepath_db_method") if hasattr(pipeline_config, "get") else None
+        for method_name in ([configured] if configured else []) + list(_UPLOADED_FILEPATH_DB_METHODS):
+            method = getattr(db, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(number)
+            except Exception:
+                logging.exception("db.%s(%s) failed", method_name, number)
+                continue
+            if isinstance(result, dict):
+                result = _document_dict_filepath(result) or result.get("uploaded_filepath")
+            elif isinstance(result, (list, tuple)) and result:
+                first = result[0]
+                result = (_document_dict_filepath(first) or first.get("uploaded_filepath")) if isinstance(first, dict) else first
+            path = normalize_text(result)
+            if path:
+                break
+
+    if not path:
+        logging.warning("CALL 8B: no uploaded_filepath found in the DB for document number %s", number)
+    with _UPLOADED_FILEPATH_LOCK:
+        _UPLOADED_FILEPATH_CACHE[number] = path
+    return path
+
+
+_UPLOADED_FILEPATH_DB_METHODS = (
+    "get_uploaded_filepath",
+    "get_uploaded_file_path",
+    "get_uploaded_filepath_by_document_number",
+    "get_document_filepath",
+)
+
+
+def _resolve_fallback_folder(file_path, pipeline_config):
+    """Turns the DB 'uploaded_filepath' (a file OR a folder) into an existing local folder, or ''."""
+    file_path = normalize_text(file_path)
+    if not file_path:
+        return ""
+    if os.path.isdir(file_path):
+        return file_path
+    if os.path.isfile(file_path):
+        return os.path.dirname(os.path.abspath(file_path))
+    # DB path may point at another mount - try the same file / folder name under the search roots.
+    base = os.path.basename(file_path.rstrip("/\\"))
+    for root in get_document_search_roots(pipeline_config):
+        found = find_file_by_name(base, root) if base else None
+        if found:
+            return os.path.dirname(os.path.abspath(found))
+        if base and os.path.isdir(os.path.join(root, base)):
+            return os.path.join(root, base)
+    parent = os.path.dirname(file_path.rstrip("/\\"))
+    return parent if parent and os.path.isdir(parent) else ""
+
+
+def _list_folder_documents(folder):
+    """Every readable document under `folder` (recursive, capped)."""
+    files = []
+    for root, _dirs, names in os.walk(folder):
+        for name in sorted(names):
+            if name.startswith("~$") or not name.lower().endswith(FOLDER_FALLBACK_EXTENSIONS):
+                continue
+            files.append(os.path.join(root, name))
+            if len(files) >= FOLDER_FALLBACK_MAX_FILES:
+                return files
+    return files
+
+
+# ---------------------------------------------------------- opening files
+def _read_docx_text(path):
+    import xml.etree.ElementTree as ET
+    w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    lines = []
+    with zipfile.ZipFile(path, "r") as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    for paragraph in root.iter(f"{{{w_ns}}}p"):
+        text = "".join(t.text or "" for t in paragraph.iter(f"{{{w_ns}}}t")).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _read_pdf_text(path):
+    parts = []
+    document = fitz.open(path)
+    try:
+        for page in document:
+            parts.append(page.get_text())
+    finally:
+        document.close()
+    return "\n".join(parts)
+
+
+def _read_xlsx_text(path):
+    lines = []
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for sheet in workbook.worksheets:
+            for row in sheet.iter_rows(values_only=True):
+                cells = [normalize_text(c) for c in row if c is not None and normalize_text(c)]
+                if cells:
+                    lines.append(" | ".join(cells))
+    finally:
+        workbook.close()
+    return "\n".join(lines)
+
+
+def _read_folder_document_text(path):
+    """Opens one document and returns its text ('' on failure). Cached per file + mtime."""
+    try:
+        key = (os.path.normcase(os.path.abspath(path)), os.path.getmtime(path))
+    except OSError:
+        return ""
+    with _FOLDER_TEXT_LOCK:
+        if key in _FOLDER_TEXT_CACHE:
+            return _FOLDER_TEXT_CACHE[key]
+    extension = os.path.splitext(path)[1].lower()
+    try:
+        if extension == ".pdf":
+            text = _read_pdf_text(path)
+        elif extension == ".docx":
+            text = _read_docx_text(path)
+        elif extension in (".xlsx", ".xlsm"):
+            text = _read_xlsx_text(path)
+        else:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+    except Exception:
+        logging.exception("CALL 8B: could not open %s", path)
+        text = ""
+    text = (text or "")[:FOLDER_FALLBACK_MAX_CHARS]
+    with _FOLDER_TEXT_LOCK:
+        _FOLDER_TEXT_CACHE[key] = text
+    return text
+
+
+# ---------------------------------------------------------- evidence check
+def _context_windows(text, pattern, max_windows=FOLDER_FALLBACK_MAX_WINDOWS):
+    """Text windows around each hit of `pattern` (overlaps merged, capped)."""
+    spans = []
+    for match in pattern.finditer(text):
+        start = max(0, match.start() - FOLDER_FALLBACK_CONTEXT_BEFORE)
+        end = min(len(text), match.end() + FOLDER_FALLBACK_CONTEXT_AFTER)
+        if spans and start <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        else:
+            spans.append((start, end))
+        if len(spans) >= max_windows:
+            break
+    return [text[s:e] for s, e in spans]
+
+
+def _evidence_is_grounded(evidence, context):
+    """True when (almost) every word of the quoted evidence really occurs in the document text."""
+    words = set(re.findall(r"[a-z0-9]+", normalize_text(evidence).lower()))
+    if not words:
+        return False
+    context_words = set(re.findall(r"[a-z0-9]+", normalize_text(context).lower()))
+    return len(words & context_words) / len(words) >= 0.8
+
+
+def _folder_llm_evidence(pipeline_config, code, document_name, context, extra_instructions=""):
+    """One LLM call on text taken from a local file; returns the parsed evidence fields."""
+    prompt = (
+        VERIFICATION_EVIDENCE_PROMPT_ROLE + "\n\n"
+        + VERIFICATION_EVIDENCE_PROMPT_TEXT
+        + extra_instructions
+        + f"\nTARGETS:\nVerification_Reference : {code}\n\n"
+        + f"DOCUMENT: {document_name}\n"
+        + "DOCUMENT EXCERPTS (use only this text):\n"
+        + context
+    )
+    response = ""
+    for _ in range(2):
+        response = call_llm(prompt, pipeline_config, question=verification_evidence_question(code))
+        if response:
+            break
+    fields = parse_verification_evidence_fields(response)
+    evidence = fields.get("evidence", "")
+    status = normalize_text(fields.get("pass_status", "")).lower()
+    if (
+        is_meaningful_evidence_field(evidence)
+        and not status.startswith("fail")
+        and _evidence_is_grounded(evidence, context)
+    ):
+        return fields
+    return {}
+
+
+def _search_folder_for_code(pipeline_config, code, files, preferred_numbers, searched):
+    """STEP 2 - open every file; first one that holds real evidence for `code` wins."""
+    pattern = _trace_code_pattern(code)
+    if pattern is None:
+        return None
+
+    def _rank(path):
+        name_numbers = _extract_folder_doc_numbers(os.path.basename(path))
+        return 0 if any(n in preferred_numbers for n in name_numbers) else 1
+
+    for path in sorted(files, key=_rank):
+        text = _read_folder_document_text(path)
+        if not text:
+            continue
+        windows = _context_windows(text, pattern)
+        if not windows:
+            continue                       # opened, code not mentioned in it
+        name = os.path.basename(path)
+        searched.append(name)
+        fields = _folder_llm_evidence(pipeline_config, code, name, "\n...\n".join(windows))
+        if fields:
+            return {"path": path, "name": name, "fields": fields, "standard": ""}
+    return None
+
+
+def _search_folder_by_standards(pipeline_config, code, files, standards, description, preferred_numbers, searched):
+    """STEP 3 - files whose NAME carries the standard (or whose document number matches)."""
+    candidates, seen = [], set()
+    for drop_year, family_only in ((False, False), (True, False), (True, True)):
+        for standard in standards:
+            pattern = _standard_filename_pattern(standard, drop_year=drop_year, family_only=family_only)
+            if not pattern:
+                continue
+            for path in files:
+                if path not in seen and pattern.search(os.path.basename(path)):
+                    seen.add(path)
+                    candidates.append((path, standard))
+    for path in files:                      # document-number match inside the same folder
+        if path not in seen and any(
+            n in preferred_numbers for n in _extract_folder_doc_numbers(os.path.basename(path))
+        ):
+            seen.add(path)
+            candidates.append((path, standards[0] if standards else ""))
+
+    code_pattern = _trace_code_pattern(code)
+    for path, standard in candidates:
+        text = _read_folder_document_text(path)
+        if not text:
+            continue
+        windows = _context_windows(text, code_pattern) if code_pattern else []
+        if not windows:
+            standard_pattern = _standard_filename_pattern(standard, drop_year=True) if standard else None
+            windows = _context_windows(text, standard_pattern) if standard_pattern else []
+        if not windows:
+            windows = [text[:6000]]
+        name = os.path.basename(path)
+        searched.append(name)
+        extra = STANDARD_EVIDENCE_PROMPT_ADDENDUM.format(
+            code=code, standards=", ".join(standards)
+        ) + f"\nEDO description: {description}\n"
+        fields = _folder_llm_evidence(pipeline_config, code, name, "\n...\n".join(windows), extra)
+        if fields:
+            return {"path": path, "name": name, "fields": fields, "standard": standard}
+    return None
+
+
+# ---------------------------------------------------------- orchestration
+def _document_label(name, number):
+    return f"{name} ({number})" if number else name
+
+
+def apply_folder_fallback_evidence(pipeline_config, edo_document, final_edos, db=None):
+    """
+    CALL 8B - see the section comment above. Changes only the codes whose
+    Column F is still "Condition Met: None" (or whose CALL 7 trace was not
+    found). Everything CALL 7 / CALL 8 already resolved is left untouched.
+    """
+    if not final_edos or not _pipeline_flag(pipeline_config, "folder_fallback_enabled", True):
+        return final_edos
+
+    # ---- Pass A: collect the codes that need the fallback ------------
+    work = []   # (edo, index, code, numbers, standards, description)
+    for edo in final_edos:
+        blocks = (edo.get("verification_evidence") or "").split("\n\n")
+        pairs = parse_verification_reference_code_filename_pairs(edo)
+        lines = [ln.strip() for ln in normalize_text(edo.get("verification_reference")).split("\n") if ln.strip()]
+        if not pairs or len(blocks) != len(pairs):
+            continue
+        statuses = edo.get("verification_trace_statuses") or {}
+        standards_by_code = parse_reference_codes_with_standards(
+            edo.get("reference_code_with_standards"), [p["code"] for p in pairs]
+        )
+        description = normalize_text(edo.get("edo_description"))
+        sibling_numbers = [
+            n for p in pairs for n in (_extract_folder_doc_numbers(p.get("doc_number")) if p.get("doc_number") else [])
+        ]
+        for index, pair in enumerate(pairs):
+            block = blocks[index]
+            status = normalize_text(statuses.get(pair["code"])).lower()
+            none_value = "Condition Met: None" in block
+            not_found = status == "unverified"
+            if not (none_value or not_found):
+                continue                    # evidence found, or Superseded (deliberately not touched)
+            numbers = []
+            for source in (pair.get("doc_number"), lines[index] if index < len(lines) else ""):
+                for number in _extract_folder_doc_numbers(source):
+                    if number not in numbers:
+                        numbers.append(number)
+            if not numbers:                 # trace not found -> no own number: use the EDO's other codes
+                numbers = list(dict.fromkeys(sibling_numbers))
+            work.append((edo, index, pair["code"], numbers,
+                         standards_by_code.get(normalize_id(pair["code"]), []), description))
+
+    if not work:
+        return final_edos
+
+    # ---- Pass B: one task per unique (code, folders, standards) -------
+    def _run(code, numbers, standards, description):
+        searched, folders = [], []
+        for number in numbers:
+            File_path = get_uploaded_file_path(db, edo_document, pipeline_config, number)   # STEP 1
+            folder = _resolve_fallback_folder(File_path, pipeline_config)
+            if folder and folder not in folders:
+                folders.append(folder)
+        files = []
+        for folder in folders:
+            files.extend(p for p in _list_folder_documents(folder) if p not in files)
+        if not files:
+            return {"folders": folders, "files": 0, "searched": searched, "hit": None}
+
+        hit = _search_folder_for_code(pipeline_config, code, files, numbers, searched)            # STEP 2
+        if hit is None and standards:
+            hit = _search_folder_by_standards(                                                    # STEP 3
+                pipeline_config, code, files, standards, description, numbers, searched
+            )
+            if hit:
+                hit["stage"] = "standard"
+        elif hit:
+            hit["stage"] = "code"
+        return {"folders": folders, "files": len(files), "searched": searched, "hit": hit}
+
+    results = {}
+    tasks = {}
+    for edo, index, code, numbers, standards, description in work:
+        key = (normalize_id(code), tuple(numbers), tuple(normalize_id(s) for s in standards))
+        tasks.setdefault(key, (code, numbers, standards, description))
+    with ThreadPoolExecutor(max_workers=LLM_CALL_MAX_WORKERS) as pool:
+        futures = {pool.submit(_run, *args): key for key, args in tasks.items()}
+        for future in as_completed(futures):
+            try:
+                results[futures[future]] = future.result()
+            except Exception:
+                logging.exception("CALL 8B task failed")
+                results[futures[future]] = {"folders": [], "files": 0, "searched": [], "hit": None}
+
+    # ---- Pass C: write Column E / F / M ------------------------------
+    for edo, index, code, numbers, standards, description in work:
+        result = results.get((normalize_id(code), tuple(numbers), tuple(normalize_id(s) for s in standards)))
+        if not result:
+            continue
+        blocks = (edo.get("verification_evidence") or "").split("\n\n")
+        trails = edo.get("evidence_pair_trail")
+        hit = result["hit"]
+
+        if hit is None:
+            if result["files"] and isinstance(trails, list) and len(trails) == len(blocks):
+                trails[index] = list(trails[index]) + [
+                    f"{result['files']} file(s) opened in the uploaded folder(s) "
+                    f"{', '.join(result['folders'])} [folder search]"
+                ]
+            continue
+
+        found_name = hit["name"]
+        found_numbers = _extract_folder_doc_numbers(found_name)
+        found_number = found_numbers[0] if found_numbers else (numbers[0] if numbers else "")
+
+        # Column F
+        blocks[index] = format_verification_evidence_block(code, found_name, hit["fields"])
+        edo["verification_evidence"] = "\n\n".join(blocks)
+        edo.setdefault("verification_evidence_raw_llm_responses", {})[code] = "(folder fallback)"
+        if isinstance(edo.get("evidence_pair_status"), list) and index < len(edo["evidence_pair_status"]):
+            edo["evidence_pair_status"][index] = "found"
+
+        # Column E ("verification reference")
+        lines = [ln.strip() for ln in normalize_text(edo.get("verification_reference")).split("\n") if ln.strip()]
+        if len(lines) == len(blocks):
+            lines[index] = f"{code} {found_number} - {found_name}".replace("  ", " ")
+            edo["verification_reference"] = "\n".join(lines)
+        doc_numbers = edo.get("verification_reference_doc_numbers")
+        if isinstance(doc_numbers, list) and index < len(doc_numbers):
+            doc_numbers[index] = found_number
+        if isinstance(edo.get("verification_trace_statuses"), dict):
+            edo["verification_trace_statuses"][code] = "Found in uploaded folder"
+
+        # Column M remark
+        label = _document_label(found_name, found_number)
+        if hit.get("stage") == "standard":
+            remark = FOLDER_TRACE_STANDARD_FOUND_REMARK.format(
+                code=code, standard=hit.get("standard") or ", ".join(standards), document=label
+            )
+        else:
+            remark = FOLDER_TRACE_FOUND_REMARK.format(code=code, document=label)
+        remarks = edo.setdefault("fallback_trace_remarks", [])
+        if remark not in remarks:
+            remarks.append(remark)
+        logging.info("CALL 8B | code=%s | %s | file=%s", code, hit.get("stage"), found_name)
 
     return final_edos
+
+
+def attach_evidence_not_found_remarks(final_edos):
+    """
+    After CALL 8: build the Column M "Gap" remarks for every code whose Column F
+    block came back with "Condition Met: None".
+
+      * source document NOT in the evidence document list
+        -> DOCUMENT_NOT_FOUND_REMARK
+      * document found/searched but no evidence inside it
+        -> EVIDENCE_NOT_FOUND_REMARK
+
+    Each remark is followed by "Documents searched for the code X: a [stage]; b [stage]"
+    listing every document CALL 8 looked in (Column E record, next-revision records,
+    standards files), in search order.  Stored in edo["evidence_not_found_remarks"].
+    Terminal blocks ("Condition Met: Fail") are skipped.
+    """
+    for edo in final_edos:
+        evidence_text = edo.get("verification_evidence", "") or ""
+        blocks = evidence_text.split("\n\n")
+        statuses = edo.get("evidence_pair_status") or []
+        trails = edo.get("evidence_pair_trail") or []
+        aligned = len(statuses) == len(blocks)
+        trails_aligned = len(trails) == len(blocks)
+
+        no_evidence_by_source, no_document_by_source, trail_for = {}, {}, {}
+        for index, block in enumerate(blocks):
+            code_m = re.search(r"^Code:\s*(.*)$", block, re.MULTILINE)
+            file_m = re.search(r"^Filename:\s*(.*)$", block, re.MULTILINE)
+            cond_m = re.search(r"^Condition Met:\s*(.*)$", block, re.MULTILINE)
+            if not (code_m and cond_m):
+                continue
+            condition = normalize_text(cond_m.group(1))
+            if condition.lower() == "fail" or is_meaningful_evidence_field(condition):
+                continue
+            source = normalize_text(file_m.group(1)) if file_m else ""
+            code = normalize_text(code_m.group(1))
+            status = statuses[index] if aligned else "found"
+
+            if status == "no_document":
+                if source.lower() in ("", "none", "n/a", "no document found"):
+                    source = ""
+                bucket = no_document_by_source.setdefault(source, [])
+            else:
+                if source.lower() in ("", "none", "n/a", "no document found"):
+                    source = "source document"
+                bucket = no_evidence_by_source.setdefault(source, [])
+            if code and code not in bucket:
+                bucket.append(code)
+            if trails_aligned and trails[index]:
+                trail_for[(status == "no_document", source, code)] = trails[index]
+
+        def _trail_text(is_missing, source, codes):
+            parts = [
+                f"Documents searched for the code {c}: " + "; ".join(trail_for[(is_missing, source, c)]) + "."
+                for c in codes if (is_missing, source, c) in trail_for
+            ]
+            return (" " + " ".join(parts)) if parts else ""
+
+        remarks = []
+        for source, codes in no_document_by_source.items():
+            remarks.append(DOCUMENT_NOT_FOUND_REMARK.format(
+                label="code" if len(codes) == 1 else "codes",
+                codes=", ".join(codes),
+                source=f"{source} " if source else "",
+            ) + _trail_text(True, source, codes))
+        for source, codes in no_evidence_by_source.items():
+            remarks.append(EVIDENCE_NOT_FOUND_REMARK.format(
+                label="code" if len(codes) == 1 else "codes",
+                codes=", ".join(codes),
+                source=source,
+            ) + _trail_text(False, source, codes))
+        edo["evidence_not_found_remarks"] = remarks
+    return final_edos
+
 
 def backfill_evidence_from_cache(final_edos, evidence_cache, edo_document):
     """
@@ -7432,14 +9269,28 @@ def build_ra_fmea_mismatch_observation(edo):
         return ""
 
     edo_number = normalize_text(edo.get("edo_tag"))
-    call2_ra = normalize_text(edo.get("RA_Number") or edo.get("ra_number"))
+    # "Original_RA_Number" is the RA from the EDO document that CALL 3
+    # replaced with the FMEA-document RA. When no replacement happened it
+    # is absent and the current RA is used, exactly as before.
+    call2_ra = normalize_text(
+        edo.get("Original_RA_Number")
+        or edo.get("RA_Number")
+        or edo.get("ra_number")
+    )
     call2_fmea = normalize_text(edo.get("FMEA_Number"))
 
     # These two values are captured directly from the EDO_FMEA response
     # during CALL 6.  They represent the actual values returned by the
     # FMEA document, not the CALL 2 input values.
-    fmea_doc_ra = normalize_text(edo.get("FMEA_Document_RA_Number"))
-    fmea_doc_fmea = normalize_text(edo.get("FMEA_Document_FMEA_Number"))
+    # CALL 3 values are preferred (CALL 6 can overwrite FMEA_Document_*).
+    fmea_doc_ra = normalize_text(
+        edo.get("Trace_FMEA_Document_RA_Number")
+        or edo.get("FMEA_Document_RA_Number")
+    )
+    fmea_doc_fmea = normalize_text(
+        edo.get("Trace_FMEA_Document_FMEA_Number")
+        or edo.get("FMEA_Document_FMEA_Number")
+    )
 
     if not edo_number or not call2_ra or not call2_fmea:
         return ""
@@ -7591,6 +9442,19 @@ def generate_remarks_and_recommendation(
             "Reference (Column E)."
         )
 
+    # ---- 1b. "Not found" lines go UNDER the Gap text (before Verification Status) ----
+    gap_not_found_lines = (
+        list(edo.get("traceability_not_found_remarks") or [])
+        + list(edo.get("evidence_not_found_remarks") or [])
+        + list(edo.get("fallback_trace_remarks") or [])
+    )
+    if gap_not_found_lines:
+        base_text = base_text.replace(
+            "\n\nVerification Status:",
+            "\n" + "\n".join(gap_not_found_lines) + "\n\nVerification Status:",
+            1,
+        )
+
     # ---- 2. Traceability Fail remarks (one line per failed verification code) ----
     observation_text = build_ra_fmea_mismatch_observation(edo)
 
@@ -7740,6 +9604,10 @@ def build_column_d_reference(edo, edo_document):
             f" {ra_number}"
             + (f" |  {ra_doc_name}" if ra_doc_name else "")
         )
+
+    # The old RA (Original_RA_Number) is NOT added here. It is written by
+    # format_edo_worksheet() as its own red, struck-through run, so it is
+    # printed once and without any label text.
 
     if has_fmea:
         reference_lines.append(
@@ -8102,19 +9970,54 @@ def format_edo_worksheet(sheet, final_edos, start_row, pipeline_config, images=N
 
             apply_risk_cell_style(sheet.cell(current_row, 12), risk)
 
-            if existing_trace_value:
+            # Old RA ID read from the EDO document (CALL 1/2) when CALL 3's
+            # RA/FMEA pair check replaced it with the FMEA-document RA.
+            # Printed in Column D as black + strikethrough (only the RA ID);
+            # the new FMEA-document RA ID on line 1 is printed in red.
+            old_ra_value = "" if is_new else normalize_text(edo.get("Original_RA_Number"))
+
+            if existing_trace_value or old_ra_value:
                 d_cell = sheet.cell(current_row, 4)
-                base_font = InlineFont(color=BLACK, rFont="Calibri", sz=10)
+                # New EDO rows: every RA/FMEA line is a NEW reference -> RED.
+                # (Previously the rich-text rebuild forced these lines BLACK
+                # whenever a trace existed, wiping the red font set above.)
+                base_font = InlineFont(color=(RED if is_new else BLACK), rFont="Calibri", sz=10)
                 trace_font = InlineFont(color=RED, rFont="Calibri", sz=10)
-                if col_d_value:
-                    d_cell.value = CellRichText(
-                        TextBlock(base_font, col_d_value),
-                        TextBlock(trace_font, "\n" + existing_trace_value),
-                    )
-                else:
-                    d_cell.value = CellRichText(
-                        TextBlock(trace_font, existing_trace_value)
-                    )
+                old_ra_font = InlineFont(color=BLACK, rFont="Calibri", sz=10, strike=True)
+                new_ra_font = InlineFont(color=RED, rFont="Calibri", sz=10)
+
+                segments = []
+                d_lines = col_d_value.split("\n") if col_d_value else []
+                if old_ra_value:
+                    # Line 1 of Column D is the (new) RA line; the old RA ID
+                    # goes on its own line directly beneath it.
+                    if d_lines:
+                        first_line = d_lines[0]
+                        new_ra_value = normalize_text(edo.get("RA_Number"))
+                        ra_pos = first_line.find(new_ra_value) if new_ra_value else -1
+                        if ra_pos >= 0:
+                            # only the new RA ID is red; "| <document name>" stays black
+                            segments.append((base_font, first_line[:ra_pos]))
+                            segments.append((new_ra_font, new_ra_value))
+                            segments.append((base_font, first_line[ra_pos + len(new_ra_value):]))
+                        else:
+                            segments.append((base_font, first_line))
+                        segments.append((base_font, "\n"))
+                    segments.append((old_ra_font, old_ra_value))
+                    if len(d_lines) > 1:
+                        segments.append((base_font, "\n" + "\n".join(d_lines[1:])))
+                elif col_d_value:
+                    segments.append((base_font, col_d_value))
+
+                if existing_trace_value:
+                    segments.append((
+                        trace_font,
+                        ("\n" + existing_trace_value) if segments else existing_trace_value
+                    ))
+
+                d_cell.value = CellRichText(
+                    *[TextBlock(font, text) for font, text in segments]
+                )
 
             row_images = []
 
@@ -8218,6 +10121,14 @@ def clear_existing_rows(sheet, start_row, end_column=10):
 
 def save_edo_workbook(workbook, pipeline_config):
     output_path = pipeline_config["output_file_path"]
+    try:
+        write_llm_debug_sheet(workbook, pipeline_config)
+    except Exception:
+        logging.exception("Could not write LLM_Debug sheet")
+    try:
+        write_trace_debug_sheet(workbook, pipeline_config)
+    except Exception:
+        logging.exception("Could not write TRACE_DEBUG sheet")
     workbook.save(output_path)
     return output_path
 
@@ -8335,7 +10246,8 @@ def generate_edo_template(
                 )
             
             except Exception as trace_error:
-                pass
+                logging.exception("CALL 3 (existing EDO trace / RA reconcile) FAILED - "
+                                  "no red new-RA / struck-out old-RA will be printed: %s", trace_error)
             pass
 
         # ---------------------------------------------------
@@ -8439,7 +10351,7 @@ def generate_edo_template(
                 db
             )
         except Exception as verification_error:
-            pass
+            logging.exception("CALL 6 failed: %s", verification_error)
         pass
 
         # ---------------------------------------------------
@@ -8477,7 +10389,7 @@ def generate_edo_template(
                 db
             )
         except Exception as traceability_reference_error:
-            pass
+            logging.exception("CALL 7 failed: %s", traceability_reference_error)
             if isinstance(final_edos, dict):
                 final_edos = list(final_edos.values())
         pass
@@ -8493,10 +10405,11 @@ def generate_edo_template(
             final_edos = extract_and_apply_verification_evidence(
                 pipeline_config,
                 edo_document,
-                final_edos
+                final_edos,
+                db
             )
         except Exception as evidence_error:
-            pass
+            logging.exception("CALL 8 failed: %s", evidence_error)
         pass
 
         if test_mode:
